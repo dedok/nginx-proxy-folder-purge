@@ -1,0 +1,15 @@
+
+#
+# (C)
+#
+
+ngx_addon_name=ngx_http_proxy_folder_purge
+
+HTTP_MODULES="$HTTP_MODULES $ngx_addon_name"
+NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_proxy_folder_purge.c"
+CFLAGS="$CFLAGS -I$ngx_addon_dir/../masks_storage"
+CORE_INCS="$CORE_INCS $ngx_feature_path/../masks_storage"
+CORE_LIBS="$CORE_LIBS $ngx_feature_libs"
+
+have=NGX_HTTP_PROXY_FOLDER_PURGE  . auto/have
+

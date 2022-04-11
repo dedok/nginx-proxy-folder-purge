@@ -1,0 +1,285 @@
+diff --git a/src/core/ngx_file.h b/src/core/ngx_file.h
+index 320adc29..1066f0f1 100644
+--- a/src/core/ngx_file.h
++++ b/src/core/ngx_file.h
+@@ -59,6 +59,9 @@ typedef struct {
+ 
+     u_char                    *conf_file;
+     ngx_uint_t                 line;
++#if defined (NGX_MASKS_STORAGE)
++    ngx_int_t                  purger_:1;
++#endif /** NGX_MASKS_STORAGE */
+ } ngx_path_t;
+ 
+ 
+diff --git a/src/http/ngx_http_file_cache.c b/src/http/ngx_http_file_cache.c
+index c40093bc..2257c9ba 100644
+--- a/src/http/ngx_http_file_cache.c
++++ b/src/http/ngx_http_file_cache.c
+@@ -10,6 +10,10 @@
+ #include <ngx_http.h>
+ #include <ngx_md5.h>
+ 
++#if defined(NGX_MASKS_STORAGE)
++# include <ngx_masks_storage.h>
++# include <ngx_masks_storage_core_api.h>
++#endif /** NGX_MASKS_STORAGE */
+ 
+ static ngx_int_t ngx_http_file_cache_lock(ngx_http_request_t *r,
+     ngx_http_cache_t *c);
+@@ -636,6 +640,22 @@ ngx_http_file_cache_read(ngx_http_request_t *r, ngx_http_cache_t *c)
+ 
+     now = ngx_time();
+ 
++#if defined(NGX_MASKS_STORAGE)
++        if (r->method_name.len == sizeof("PURGE") - 1
++                && ngx_strncmp(r->method_name.data, "PURGE", sizeof("PURGE") - 1)
++                    == 0)
++        {
++            /** Do nothing, it's purge request */
++        } else {
++            rc = ngx_http_foreground_purge(r, r->cache, now);
++            if (rc == NGX_ERROR) {
++                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
++                    "http file cache: foreground purge failed, rc = %d", rc);
++                /** Do not Interrupt? return NGX_ERROR; */
++            }
++        }
++#endif /** NGX_MASKS_STORAGE */
++
+     if (c->valid_sec < now) {
+         c->stale_updating = c->valid_sec + c->updating_sec >= now;
+         c->stale_error = c->valid_sec + c->error_sec >= now;
+diff --git a/src/os/unix/ngx_process_cycle.c b/src/os/unix/ngx_process_cycle.c
+index f87e0092..f19bd4b0 100644
+--- a/src/os/unix/ngx_process_cycle.c
++++ b/src/os/unix/ngx_process_cycle.c
+@@ -10,11 +10,18 @@
+ #include <ngx_event.h>
+ #include <ngx_channel.h>
+ 
++#if defined (NGX_MASKS_STORAGE)
++# include <ngx_masks_storage_core_api.h>
++#endif /** NGX_MASKS_STORAGE */
+ 
+ static void ngx_start_worker_processes(ngx_cycle_t *cycle, ngx_int_t n,
+     ngx_int_t type);
+ static void ngx_start_cache_manager_processes(ngx_cycle_t *cycle,
+     ngx_uint_t respawn);
++#if defined (NGX_MASKS_STORAGE)
++static void ngx_masks_storage_spawn_background_purge_process(
++            ngx_cycle_t *cycle, ngx_path_t *purge_path, ngx_int_t respawn);
++#endif /** NGX_MASKS_STORAGE */
+ static void ngx_pass_open_channel(ngx_cycle_t *cycle, ngx_channel_t *ch);
+ static void ngx_signal_worker_processes(ngx_cycle_t *cycle, int signo);
+ static ngx_uint_t ngx_reap_children(ngx_cycle_t *cycle);
+@@ -365,6 +372,10 @@ ngx_start_cache_manager_processes(ngx_cycle_t *cycle, ngx_uint_t respawn)
+     ngx_path_t     **path;
+     ngx_channel_t    ch;
+ 
++#if defined (NGX_MASKS_STORAGE)
++    ngx_path_t *purger_path = NULL;
++#endif /** NGX_MASKS_STORAGE */
++
+     manager = 0;
+     loader = 0;
+ 
+@@ -378,7 +389,22 @@ ngx_start_cache_manager_processes(ngx_cycle_t *cycle, ngx_uint_t respawn)
+         if (path[i]->loader) {
+             loader = 1;
+         }
++#if defined (NGX_MASKS_STORAGE)
++        if (path[i]->purger_) {
++            purger_path = path[i];
++        }
++#endif /** NGX_MASKS_STORAGE*/
++    }
++
++#if defined (NGX_MASKS_STORAGE)
++    ngx_log_error(NGX_LOG_INFO, cycle->log, 0,
++            "background purge: purger_path ptr = %p, cycle = %p, respawn = %d", 
++            purger_path, cycle, respawn);
++    if (purger_path && manager != 0) {
++        ngx_masks_storage_spawn_background_purge_process(cycle,
++                purger_path, respawn);
+     }
++#endif /* NGX_MASKS_STORAGE */
+ 
+     if (manager == 0) {
+         return;
+@@ -1217,3 +1243,175 @@ ngx_cache_loader_process_handler(ngx_event_t *ev)
+ 
+     exit(0);
+ }
++
++/** The background purge {{{
++ *
++ * The background purge - is process, which allows purge a nginx's cache uging
++ * masks. Also, It is a standalone process, since it may be very heavy.
++ **/
++#if defined (NGX_MASKS_STORAGE)
++
++#define PURGE_PROCESS_NAME "background purge process"
++
++
++typedef struct {
++    ngx_event_handler_pt            handler_;
++    char                           *name_;
++    ngx_msec_t                      delay_;
++    ngx_path_t                     *path_;
++    ngx_pool_t                     *pool_;
++    ngx_cycle_t                    *cycle_;
++    ngx_event_t                     ev_;
++} ngx_purge_ctx_t;
++
++
++static void ngx_purge_process_handler(ngx_event_t *ev);
++static void ngx_purge_process_cycle(ngx_cycle_t *cycle, void *data);
++
++
++static void
++ngx_purge_process_handler(ngx_event_t *ev)
++{
++    ngx_msec_t             next;
++    ngx_purge_ctx_t   *ctx;
++    void                  *ms; /* masks storage ptr */
++    ngx_int_t              rc;
++
++
++    ctx = (ngx_purge_ctx_t *) ev->data;
++    ms = ctx->path_->data;
++    next = ngx_masks_storage_purger_sleep(ms);
++
++    ngx_time_update();
++
++    if (ngx_masks_storage_purger_is_off(ms) == NGX_OK) {
++        ngx_log_error(NGX_LOG_INFO, ev->log, 0,
++                "background purge process: is off by configuration, yielding");
++        next = 1000 * 60 /* 60 sec */;
++        goto yield;
++    }
++
++    /** NGX_ -OK or -DECLINED */
++    rc = ngx_masks_storage_prepare_purger_queue(ms, ctx->pool_, ev->log,
++            &ctx->path_->name);
++    if (rc == NGX_OK) {
++        /** Purge */
++        ngx_masks_storage_background_purge(ms, ctx->pool_, ev->log,
++            &ctx->path_->name, ctx->cycle_, &ctx->ev_);
++    }
++
++yield:
++    ngx_add_timer(ev, next);
++}
++
++
++static void
++ngx_purge_process_cycle(ngx_cycle_t *cycle, void *data)
++{
++    ngx_purge_ctx_t *ctx = data;
++
++    ngx_int_t     rc;
++    ngx_event_t   ev;
++
++    /*
++     * Set correct process type since closing listening Unix domain socket
++     * in a master process also removes the Unix domain socket file.
++     */
++    ngx_process = NGX_PROCESS_HELPER;
++
++    ngx_close_listening_sockets(cycle);
++
++    /* Set a moderate number of connections for a helper process. */
++    cycle->connection_n = 512;
++
++    ngx_worker_process_init(cycle, -1);
++
++    ngx_memzero(&ev, sizeof(ngx_event_t));
++    ev.handler = ctx->handler_;
++    ev.data = (void *) ctx;
++    ev.log = cycle->log;
++
++    ngx_use_accept_mutex = 0;
++
++    ngx_setproctitle(ctx->name_);
++
++    if (ctx->delay_ == 0) {
++        /** Or the timer will have a too big value */
++        ctx->delay_ = 1;
++    }
++
++    ngx_add_timer(&ev, ctx->delay_);
++
++    /** Restore */
++    rc = ngx_masks_storage_background_purge_init(ctx->path_->data,
++            ctx->pool_, ev.log, &ctx->path_->name);
++    if (rc == NGX_ERROR) {
++        ngx_log_error(NGX_LOG_ERR, ev.log, 0,
++                "background purge process: "
++                "can't restore masks storage exiting, rc = %d", rc);
++        exit(1);
++    }
++
++    /** Main loop */
++    for ( ;; ) {
++
++        if (ngx_terminate || ngx_quit) {
++            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
++                    "background purge process: exiting");
++            exit(0);
++        }
++
++        if (ngx_reopen) {
++            ngx_reopen = 0;
++            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
++                    "background purge process: reopening logs");
++            ngx_reopen_files(cycle, -1);
++        }
++
++        ngx_process_events_and_timers(cycle);
++    }
++}
++
++
++static void
++ngx_masks_storage_spawn_background_purge_process(ngx_cycle_t *cycle,
++        ngx_path_t *purge_path, ngx_int_t respawn)
++{
++    ngx_channel_t            ch;
++    ngx_purge_ctx_t     *ctx;
++
++    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
++            "background purge process: starting, masks storage path = \"%V\"",
++            purge_path);
++
++    ctx = ngx_pnalloc(cycle->pool, sizeof(ngx_purge_ctx_t));
++    if (ctx == NULL) {
++        /* fatal */
++        ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
++            "background purge process: failed ngx_pnalloc");
++        exit(2);
++    }
++
++    ctx->handler_ = ngx_purge_process_handler;
++    ctx->name_ = PURGE_PROCESS_NAME;
++    ctx->delay_ = 0;
++    ctx->path_ = purge_path;
++    ctx->pool_ = cycle->pool;
++    ctx->cycle_ = cycle;
++    ngx_memzero(&ctx->ev_, sizeof(ngx_event_t));
++
++    ngx_spawn_process(cycle, ngx_purge_process_cycle,
++                      ctx, PURGE_PROCESS_NAME,
++                      respawn ? NGX_PROCESS_JUST_RESPAWN : NGX_PROCESS_RESPAWN);
++
++    ch.command = NGX_CMD_OPEN_CHANNEL;
++    ch.pid = ngx_processes[ngx_process_slot].pid;
++    ch.slot = ngx_process_slot;
++    ch.fd = ngx_processes[ngx_process_slot].channel[0];
++
++    ngx_pass_open_channel(cycle, &ch);
++}
++
++/** }}} */
++#endif /* PURGE_PROCESS_N*/
++
