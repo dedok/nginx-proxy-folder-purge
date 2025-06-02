@@ -139,11 +139,7 @@ Header **X-Purge-Options** must be one of options
 
 * **dump**: Dump gets last tasks after call invalidate command
 * **flush**: Flush history at dump
-* **invalidate**: invalidating cache, don't remove file from the disk
-* **invalidate-recursive**: recursive invaldation
 * **delete**: deleting files from the cache server
-* **delete-recursive**: recursive deleting files
-
 
 See also
 ========

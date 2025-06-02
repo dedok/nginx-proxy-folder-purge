@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 
 #
 # (c)
@@ -13,11 +13,10 @@ from http_utils import *
 
 #
 # Description:
-# This tests is about testing some foreground masks storage cases
+# This tests for testing _root_ cases
 #
 # The test requires that nginx will be started with
 # `conf/foreground_purge.conf`.
-#
 #
 
 print ('[!] WARNINGS.\n'
@@ -25,36 +24,22 @@ print ('[!] WARNINGS.\n'
         '- This test expectes nginx builded with an option NGX_DEBUG 1\n')
 
 URL = "http://127.0.0.1:8082"
-MASKS_STORAGE = "./test-root/masks_storage/masks.*"
-CACHE = "./test-root/cache/*"
-
-print ('[+] Flush & Cleanup')
-purge_success(URL + "/*", {"X-Purge-Options": "flush"})
-try:
-    os.popen('rm -Rf {}'.format(MASKS_STORAGE))
-except:
-    pass
-try:
-    os.popen('rm -Rf {}'.format(CACHE))
-except:
-    pass
-print ('[+] OK')
+MASKS_STORAGE = sys.argv[1] + "/masks_storage/masks.in*"
+CACHE = sys.argv[1] + "/cache/*"
 
 def read_masks_storage():
     res = []
     for raw_mask in os.popen('cat {}'.format(MASKS_STORAGE)).read().split():
-        magic, domain, mask, flags, timestamp = raw_mask.split(',')
+        magic, domain, mask, timestamp = raw_mask.split(',')
         res.append({'magic': magic, 'domain': domain, 'mask': mask,
-            'flags': int(flags), 'timestamp': int(timestamp)})
+            'timestamp': int(timestamp)})
     return res
 
-print ('[+] NCCS-728')
+print ('[+] Test root cause with two delete operations')
 uri = URL + "/foreground_purge_on/"
-purge_success(uri + "*", {'Host': 'purge_folder',
-    "X-Purge-Options": "delete"})
+purge_success(uri + "/abc/*", {'Host': 'purge_folder'})
 time.sleep(1)
-purge_success(uri + "*", {'Host': 'purge_folder',
-    "X-Purge-Options": "delete"})
+purge_success(uri + "/dca/*", {'Host': 'purge_folder'})
 r = read_masks_storage()
 assert len(r) == 2, 'expected 2 rows'
 assert r[0]['timestamp'] != r[1]['timestamp'], 'regression, timestamps are '\

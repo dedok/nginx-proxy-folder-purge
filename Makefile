@@ -27,8 +27,8 @@ build:
 
 # Note: Debug only
 configure:
-#	cd $(NGX_PATH) && \
-#		git apply $(MODULE_PATH)/patches/nginx.ver_1019004.patch
+	cd $(NGX_PATH) && \
+		git apply $(MODULE_PATH)/patches/nginx.ver_1019004.patch
 	cd $(NGX_PATH) && \
 		$(NGX_CONFIGURE) \
 						--with-cc-opt="$(DEV_CFLAGS)" \
@@ -38,7 +38,7 @@ configure:
 						--add-module=$(MODULE_PATH)/masks_storage \
 						--add-module=$(MODULE_PATH)/proxy_folder_purge
 
-#	mkdir -p $(PREFIX_PATH)/conf $(PREFIX_PATH)/logs
-#	cp -Rf $(NGX_PATH)/conf/* $(PREFIX_PATH)/conf
-#	cp -f $(MODULE_PATH)/conf/*.conf $(PREFIX_PATH)/conf/
+	mkdir -p $(PREFIX_PATH)/conf $(PREFIX_PATH)/logs
+	cp -Rf $(NGX_PATH)/conf/* $(PREFIX_PATH)/conf
+	cp -f $(MODULE_PATH)/conf/*.conf $(PREFIX_PATH)/conf/
 

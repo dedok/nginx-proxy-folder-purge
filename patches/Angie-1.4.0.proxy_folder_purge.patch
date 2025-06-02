@@ -1,5 +1,5 @@
 diff --git a/src/core/ngx_file.h b/src/core/ngx_file.h
-index 320adc29..1066f0f1 100644
+index 320adc295..1066f0f16 100644
 --- a/src/core/ngx_file.h
 +++ b/src/core/ngx_file.h
 @@ -59,6 +59,9 @@ typedef struct {
@@ -13,10 +13,10 @@ index 320adc29..1066f0f1 100644
  
  
 diff --git a/src/http/ngx_http_file_cache.c b/src/http/ngx_http_file_cache.c
-index c40093bc..2257c9ba 100644
+index 0a8566376..101be9020 100644
 --- a/src/http/ngx_http_file_cache.c
 +++ b/src/http/ngx_http_file_cache.c
-@@ -10,6 +10,10 @@
+@@ -11,6 +11,10 @@
  #include <ngx_http.h>
  #include <ngx_md5.h>
  
@@ -27,7 +27,7 @@ index c40093bc..2257c9ba 100644
  
  static ngx_int_t ngx_http_file_cache_lock(ngx_http_request_t *r,
      ngx_http_cache_t *c);
-@@ -636,6 +640,25 @@ ngx_http_file_cache_read(ngx_http_request_t *r, ngx_http_cache_t *c)
+@@ -781,6 +785,25 @@ ngx_http_file_cache_read(ngx_http_request_t *r, ngx_http_cache_t *c)
  
      now = ngx_time();
  
@@ -54,31 +54,35 @@ index c40093bc..2257c9ba 100644
          c->stale_updating = c->valid_sec + c->updating_sec >= now;
          c->stale_error = c->valid_sec + c->error_sec >= now;
 diff --git a/src/os/unix/ngx_process_cycle.c b/src/os/unix/ngx_process_cycle.c
-index f87e0092..f19bd4b0 100644
+index 829fe0436..2cec2c416 100644
 --- a/src/os/unix/ngx_process_cycle.c
 +++ b/src/os/unix/ngx_process_cycle.c
-@@ -10,11 +10,18 @@
+@@ -11,6 +11,10 @@
  #include <ngx_event.h>
  #include <ngx_channel.h>
  
-+#if defined (NGX_MASKS_STORAGE)
++#if 1 || defined (NGX_MASKS_STORAGE)
 +# include <ngx_masks_storage_core_api.h>
 +#endif /** NGX_MASKS_STORAGE */
++
  
  static void ngx_start_worker_processes(ngx_cycle_t *cycle, ngx_int_t n,
      ngx_int_t type);
- static void ngx_start_cache_manager_processes(ngx_cycle_t *cycle,
-     ngx_uint_t respawn);
-+#if defined (NGX_MASKS_STORAGE)
+@@ -28,6 +32,11 @@ static void ngx_cache_manager_process_cycle(ngx_cycle_t *cycle, void *data);
+ static void ngx_cache_manager_process_handler(ngx_event_t *ev);
+ static void ngx_cache_loader_process_handler(ngx_event_t *ev);
+ 
++#if 1 || defined (NGX_MASKS_STORAGE)
 +static void ngx_masks_storage_spawn_background_purge_process(
 +            ngx_cycle_t *cycle, ngx_path_t *purge_path, ngx_int_t respawn);
 +#endif /** NGX_MASKS_STORAGE */
- static void ngx_pass_open_channel(ngx_cycle_t *cycle, ngx_channel_t *ch);
- static void ngx_signal_worker_processes(ngx_cycle_t *cycle, int signo);
- static ngx_uint_t ngx_reap_children(ngx_cycle_t *cycle);
-@@ -365,6 +372,10 @@ ngx_start_cache_manager_processes(ngx_cycle_t *cycle, ngx_uint_t respawn)
-     ngx_path_t     **path;
-     ngx_channel_t    ch;
++
+ 
+ ngx_uint_t    ngx_process;
+ ngx_uint_t    ngx_worker;
+@@ -366,6 +375,10 @@ ngx_start_cache_manager_processes(ngx_cycle_t *cycle, ngx_uint_t respawn)
+     ngx_uint_t    i, manager, loader;
+     ngx_path_t  **path;
  
 +#if defined (NGX_MASKS_STORAGE)
 +    ngx_path_t *purger_path = NULL;
@@ -87,7 +91,7 @@ index f87e0092..f19bd4b0 100644
      manager = 0;
      loader = 0;
  
-@@ -378,7 +389,22 @@ ngx_start_cache_manager_processes(ngx_cycle_t *cycle, ngx_uint_t respawn)
+@@ -379,7 +392,22 @@ ngx_start_cache_manager_processes(ngx_cycle_t *cycle, ngx_uint_t respawn)
          if (path[i]->loader) {
              loader = 1;
          }
@@ -110,7 +114,7 @@ index f87e0092..f19bd4b0 100644
  
      if (manager == 0) {
          return;
-@@ -1217,3 +1243,175 @@ ngx_cache_loader_process_handler(ngx_event_t *ev)
+@@ -1201,3 +1229,173 @@ ngx_cache_loader_process_handler(ngx_event_t *ev)
  
      exit(0);
  }
@@ -214,8 +218,12 @@ index f87e0092..f19bd4b0 100644
 +    ngx_add_timer(&ev, ctx->delay_);
 +
 +    /** Restore */
-+    rc = ngx_masks_storage_background_purge_init(ctx->path_->data,
-+            ctx->pool_, ev.log, &ctx->path_->name);
++    rc = ngx_masks_storage_background_purge_init(
++            cycle,
++            ctx->path_->data,
++            ctx->pool_,
++            ev.log,
++            &ctx->path_->name);
 +    if (rc == NGX_ERROR) {
 +        ngx_log_error(NGX_LOG_ERR, ev.log, 0,
 +                "background purge process: "
@@ -226,13 +234,13 @@ index f87e0092..f19bd4b0 100644
 +    /** Main loop */
 +    for ( ;; ) {
 +
-+        if (ngx_terminate || ngx_quit || ngx_quit_wait) {
++        if (ngx_terminate || ngx_quit) {
 +            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
 +                    "background purge process: exiting");
 +            exit(0);
 +        }
 +
-+        if (ngx_reopen || ngx_reopen_wait) {
++        if (ngx_reopen) {
 +            ngx_reopen = 0;
 +            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
 +                    "background purge process: reopening logs");
@@ -248,7 +256,6 @@ index f87e0092..f19bd4b0 100644
 +ngx_masks_storage_spawn_background_purge_process(ngx_cycle_t *cycle,
 +        ngx_path_t *purge_path, ngx_int_t respawn)
 +{
-+    ngx_channel_t            ch;
 +    ngx_purge_ctx_t     *ctx;
 +
 +    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
@@ -275,12 +282,7 @@ index f87e0092..f19bd4b0 100644
 +                      ctx, PURGE_PROCESS_NAME,
 +                      respawn ? NGX_PROCESS_JUST_RESPAWN : NGX_PROCESS_RESPAWN);
 +
-+    ch.command = NGX_CMD_OPEN_CHANNEL;
-+    ch.pid = ngx_processes[ngx_process_slot].pid;
-+    ch.slot = ngx_process_slot;
-+    ch.fd = ngx_processes[ngx_process_slot].channel[0];
-+
-+    ngx_pass_open_channel(cycle, &ch);
++    ngx_pass_open_channel(cycle);
 +}
 +
 +/** }}} */

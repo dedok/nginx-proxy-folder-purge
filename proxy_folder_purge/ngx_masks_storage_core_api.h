@@ -12,12 +12,12 @@
 #ifndef NGX_MASKS_STORAGE_CORE_API_H_
 #define NGX_MASKS_STORAGE_CORE_API_H_ 1
 
-#include <nginx.h>
-#include <ngx_core.h>
 #include <ngx_config.h>
+#include <ngx_core.h>
+#include <nginx.h>
 
 ngx_int_t ngx_masks_storage_purger_is_off(void *ms);
-ngx_int_t ngx_masks_storage_background_purge_init(void *ms,
+ngx_int_t ngx_masks_storage_background_purge_init(ngx_cycle_t *cycle, void *ms,
         ngx_pool_t *pool, ngx_log_t *log, ngx_str_t *dirname);
 
 ngx_msec_t ngx_masks_storage_background_purge(void *ms, ngx_pool_t *pool,

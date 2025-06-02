@@ -9,9 +9,14 @@
 #include <ngx_http.h>
 #include <ngx_masks_storage.h>
 
-#ifndef nginx_version
-#     error This module cannot be build against an unknown nginx version.
-#endif
+
+#if NGX_CACHE_PURGE_MODULE
+#error "Please off cache_purge_module. It's higly not recomented to use "
+        "both modules in the same build."
+#endif /** NGX_CACHE_PURGE_MODULE */
+
+
+#define _LP "proxy_folder_purge: "
 
 
 typedef struct {
@@ -21,12 +26,11 @@ typedef struct {
     ngx_array_t                  *access6;  /* array of ngx_in6_cidr_t */
 } ngx_http_folder_purge_conf_t;
 
-typedef struct {
-    ngx_http_folder_purge_conf_t   proxy;
 
-    ngx_http_folder_purge_conf_t  *conf;
-    ngx_http_handler_pt           handler;
-    ngx_http_handler_pt           original_handler;
+typedef struct {
+    ngx_http_folder_purge_conf_t   cf;
+    ngx_http_handler_pt            handler;
+    ngx_http_handler_pt            original_handler;
 } ngx_http_folder_purge_loc_conf_t;
 
 
@@ -57,6 +61,7 @@ static ngx_command_t  ngx_http_folder_purge_module_commands[] = {
       ngx_null_command
 };
 
+
 static ngx_http_module_t  ngx_http_folder_purge_module_ctx = {
     NULL,                                  /* preconfiguration */
     NULL,                                  /* postconfiguration */
@@ -71,143 +76,35 @@ static ngx_http_module_t  ngx_http_folder_purge_module_ctx = {
     ngx_http_folder_purge_merge_loc_conf    /* merge location configuration */
 };
 
+
 ngx_module_t  ngx_http_proxy_folder_purge = {
     NGX_MODULE_V1,
     &ngx_http_folder_purge_module_ctx,      /* module context */
     ngx_http_folder_purge_module_commands,  /* module directives */
-    NGX_HTTP_MODULE,                       /* module type */
-    NULL,                                  /* init master */
-    NULL,                                  /* init module */
-    NULL,                                  /* init process */
-    NULL,                                  /* init thread */
-    NULL,                                  /* exit thread */
-    NULL,                                  /* exit process */
-    NULL,                                  /* exit master */
+    NGX_HTTP_MODULE,                        /* module type */
+    NULL,                                   /* init master */
+    NULL,                                   /* init module */
+    NULL,                                   /* init process */
+    NULL,                                   /* init thread */
+    NULL,                                   /* exit thread */
+    NULL,                                   /* exit process */
+    NULL,                                   /* exit master */
     NGX_MODULE_V1_PADDING
 };
-
-extern ngx_module_t  ngx_http_proxy_module;
-
-typedef struct {
-    ngx_str_t                      key_start;
-    ngx_str_t                      schema;
-    ngx_str_t                      host_header;
-    ngx_str_t                      port;
-    ngx_str_t                      uri;
-} ngx_http_proxy_vars_t;
-
-#  if (nginx_version >= 1007009)
-
-typedef struct {
-    ngx_array_t                    caches;  /* ngx_http_file_cache_t * */
-} ngx_http_proxy_main_conf_t;
-
-#  endif /* nginx_version >= 1007009 */
-
-#  if (nginx_version >= 1007008)
-
-typedef struct {
-    ngx_array_t                   *flushes;
-    ngx_array_t                   *lengths;
-    ngx_array_t                   *values;
-    ngx_hash_t                     hash;
-} ngx_http_proxy_headers_t;
-
-#  endif /* nginx_version >= 1007008 */
-
-typedef struct {
-    ngx_http_upstream_conf_t       upstream;
-
-#  if (nginx_version >= 1007008)
-    ngx_array_t                   *body_flushes;
-    ngx_array_t                   *body_lengths;
-    ngx_array_t                   *body_values;
-    ngx_str_t                      body_source;
-
-    ngx_http_proxy_headers_t       headers;
-    ngx_http_proxy_headers_t       headers_cache;
-#  else
-    ngx_array_t                   *flushes;
-    ngx_array_t                   *body_set_len;
-    ngx_array_t                   *body_set;
-    ngx_array_t                   *headers_set_len;
-    ngx_array_t                   *headers_set;
-    ngx_hash_t                     headers_set_hash;
-#  endif /* nginx_version >= 1007008 */
-
-    ngx_array_t                   *headers_source;
-#  if (nginx_version < 8040)
-    ngx_array_t                   *headers_names;
-#  endif /* nginx_version < 8040 */
-
-    ngx_array_t                   *proxy_lengths;
-    ngx_array_t                   *proxy_values;
-
-    ngx_array_t                   *redirects;
-#  if (nginx_version >= 1001015)
-    ngx_array_t                   *cookie_domains;
-    ngx_array_t                   *cookie_paths;
-#  endif /* nginx_version >= 1001015 */
-
-#  if (nginx_version < 1007008)
-    ngx_str_t                      body_source;
-#  endif /* nginx_version < 1007008 */
-
-#  if (nginx_version >= 1011006)
-    ngx_http_complex_value_t      *method;
-#  else
-    ngx_str_t                      method;
-#  endif /* nginx_version >= 1011006 */
-
-    ngx_str_t                      location;
-    ngx_str_t                      url;
-
-    ngx_http_complex_value_t       cache_key;
-
-    ngx_http_proxy_vars_t          vars;
-
-    ngx_flag_t                     redirect;
-
-#  if (nginx_version >= 1001004)
-    ngx_uint_t                     http_version;
-#  endif /* nginx_version >= 1001004 */
-
-    ngx_uint_t                     headers_hash_max_size;
-    ngx_uint_t                     headers_hash_bucket_size;
-
-#  if (NGX_HTTP_SSL)
-#    if (nginx_version >= 1005006)
-    ngx_uint_t                     ssl;
-    ngx_uint_t                     ssl_protocols;
-    ngx_str_t                      ssl_ciphers;
-#    endif /* nginx_version >= 1005006 */
-#    if (nginx_version >= 1007000)
-    ngx_uint_t                     ssl_verify_depth;
-    ngx_str_t                      ssl_trusted_certificate;
-    ngx_str_t                      ssl_crl;
-#    endif /* nginx_version >= 1007000 */
-#    if (nginx_version >= 1007008)
-    ngx_str_t                      ssl_certificate;
-    ngx_str_t                      ssl_certificate_key;
-    ngx_array_t                   *ssl_passwords;
-#    endif /* nginx_version >= 1007008 */
-#  endif
-} ngx_http_proxy_loc_conf_t;
 
 
 char *
 ngx_http_proxy_folder_purge_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    ngx_http_folder_purge_loc_conf_t   *cplcf;
+    ngx_http_folder_purge_loc_conf_t   *c;
 
-    cplcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_proxy_folder_purge);
+    c = ngx_http_conf_get_module_loc_conf(cf, ngx_http_proxy_folder_purge);
 
-    /* check for duplicates / collisions */
-    if (cplcf->proxy.enable != NGX_CONF_UNSET) {
+    if (c->cf.enable != NGX_CONF_UNSET) {
         return "is duplicate";
     }
 
-    return ngx_http_folder_purge_conf(cf, &cplcf->proxy);
+    return ngx_http_folder_purge_conf(cf, &c->cf);
 }
 
 
@@ -224,18 +121,16 @@ ngx_http_proxy_folder_purge_handler(ngx_http_request_t *r)
     }
 #endif /** NGX_HAVE_FILE_AIO */
 
-#if defined (NGX_DEBUG)
+    /** Check aux functions first */
     if (ngx_http_folder_dump(r) == NGX_MASKS_STORAGE_OK) {
         (void) ngx_http_folder_send_dump_handler(r);
         goto exit;
-    }
-
-    if (ngx_http_folder_flush(r) == NGX_MASKS_STORAGE_OK) {
+    } else if (ngx_http_folder_flush(r) == NGX_MASKS_STORAGE_OK) {
         (void) ngx_http_folder_send_flush_handler(r);
         goto exit;
     }
-#endif /* (NGX_DEBUG) */
 
+    /** Add purging */
     ngx_str_set(&content_type, "plain/text");
     ngx_memzero(&cv, sizeof(ngx_http_complex_value_t));
 
@@ -253,11 +148,9 @@ ngx_http_proxy_folder_purge_handler(ngx_http_request_t *r)
             rc = ngx_http_send_response(r, NGX_HTTP_OK, &content_type, &cv);
             if (rc == NGX_OK) {
                 rc = NGX_HTTP_OK;
-
             } else {
                 ngx_str_set(&cv.value, "{\"status\": \"failed\"}");
                 rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
-
             }
             /** rc ~== NGX_HTTP_OK */
             break;
@@ -278,7 +171,7 @@ ngx_http_proxy_folder_purge_handler(ngx_http_request_t *r)
         case NGX_MASKS_STORAGE_DENY:
         default:
             ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                "masks_storage: unknown response=%d for \"%V\"",
+                _LP "unknown response=%d (or storage is failed) for \"%V\"",
                 rc, &r->uri);
             rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
             break;
@@ -286,10 +179,7 @@ ngx_http_proxy_folder_purge_handler(ngx_http_request_t *r)
 
     ngx_http_finalize_request(r, rc);
 
-#if (NGX_HAVE_FILE_AIO || NGX_DEBUG)
 exit:
-#endif /** NGX_HAVE_FILE_AIO || NGX_DEBUG */
-
     return NGX_DONE;
 }
 
@@ -297,34 +187,46 @@ exit:
 ngx_int_t
 ngx_http_folder_purge_access_handler(ngx_http_request_t *r)
 {
-    ngx_http_folder_purge_loc_conf_t   *cplcf;
+    ngx_http_folder_purge_loc_conf_t   *c;
 
-    cplcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_folder_purge);
+    c = ngx_http_get_module_loc_conf(r, ngx_http_proxy_folder_purge);
 
-    if (!cplcf || !cplcf->conf) {
+    if (c == NULL) {
+
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                _LP "ngx_http_proxy_folder_purge_handler: loc conf is NULL "
+                "this is not expected");
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    if (r->method_name.len != cplcf->conf->method.len
-        || (ngx_strncmp(r->method_name.data, cplcf->conf->method.data,
-                        r->method_name.len)))
-    {
-        return cplcf->original_handler(r);
+    if (!c->cf.enable) {
+        return c->original_handler(r);
     }
 
-    if ((cplcf->conf->access || cplcf->conf->access6)
-         && ngx_http_folder_purge_access(cplcf->conf->access,
-                                        cplcf->conf->access6,
-                                        r->connection->sockaddr) != NGX_OK)
+    if (r->method_name.len != c->cf.method.len
+        || (ngx_strncmp(r->method_name.data, c->cf.method.data,
+                        r->method_name.len)))
+    {
+        return c->original_handler(r);
+    }
+
+    if ((c->cf.access || c->cf.access6)
+         && ngx_http_folder_purge_access(c->cf.access,
+                                         c->cf.access6,
+                                         r->connection->sockaddr) != NGX_OK)
     {
         return NGX_HTTP_FORBIDDEN;
     }
 
-    if (cplcf->handler == NULL) {
+    if (c->handler == NULL) {
+
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                _LP "folder purge handler is not configured for the "
+                "PURGE request");
         return NGX_HTTP_NOT_FOUND;
     }
 
-    return cplcf->handler(r);
+    return c->handler(r);
 }
 
 
@@ -437,7 +339,7 @@ ngx_http_folder_purge_conf(ngx_conf_t *cf, ngx_http_folder_purge_conf_t *cpcf)
     /* sanity check */
     if (ngx_strcmp(value[2].data, "from") != 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "invalid parameter \"%V\", expected"
+                           _LP "invalid parameter \"%V\", expected"
                            " \"from\" keyword", &value[2]);
         return NGX_CONF_ERROR;
     }
@@ -452,13 +354,13 @@ ngx_http_folder_purge_conf(ngx_conf_t *cf, ngx_http_folder_purge_conf_t *cpcf)
 
         if (rc == NGX_ERROR) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "invalid parameter \"%V\"", &value[i]);
+                               _LP "invalid parameter \"%V\"", &value[i]);
             return NGX_CONF_ERROR;
         }
 
         if (rc == NGX_DONE) {
             ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                               "low address bits of %V are meaningless",
+                               _LP "low address bits of %V are meaningless",
                                &value[i]);
         }
 
@@ -539,9 +441,7 @@ ngx_http_folder_purge_create_loc_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    conf->proxy.enable = NGX_CONF_UNSET;
-
-    conf->conf = NGX_CONF_UNSET_PTR;
+    conf->cf.enable = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -552,29 +452,20 @@ ngx_http_folder_purge_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 {
     ngx_http_folder_purge_loc_conf_t  *prev = parent;
     ngx_http_folder_purge_loc_conf_t  *conf = child;
-    ngx_http_core_loc_conf_t         *clcf;
-    ngx_http_proxy_loc_conf_t        *plcf;
+    ngx_http_core_loc_conf_t          *clcf;
 
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
 
-    ngx_http_folder_purge_merge_conf(&conf->proxy, &prev->proxy);
+    ngx_http_folder_purge_merge_conf(&conf->cf, &prev->cf);
 
-    if (conf->proxy.enable && clcf->handler != NULL) {
-        plcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_proxy_module);
+    if (conf->cf.enable && clcf->handler != NULL) {
 
-        if (plcf->upstream.upstream || plcf->proxy_lengths) {
-            conf->conf = &conf->proxy;
-            conf->handler = plcf->upstream.cache
-                          ? ngx_http_proxy_folder_purge_handler : NULL;
-            conf->original_handler = clcf->handler;
+        conf->handler = ngx_http_proxy_folder_purge_handler;
+        conf->original_handler = clcf->handler;
+        clcf->handler = ngx_http_folder_purge_access_handler;
 
-            clcf->handler = ngx_http_folder_purge_access_handler;
-
-            return NGX_CONF_OK;
-        }
+        return NGX_CONF_OK;
     }
-
-    ngx_conf_merge_ptr_value(conf->conf, prev->conf, NULL);
 
     if (conf->handler == NULL) {
         conf->handler = prev->handler;

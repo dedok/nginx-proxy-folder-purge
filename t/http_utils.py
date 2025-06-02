@@ -4,7 +4,7 @@
 
 import json
 import urllib
-import urllib2
+import urllib.request
 import traceback
 
 
@@ -14,16 +14,23 @@ VERBOSE = False
 def request(method, url, headers, data):
     out = ''
     try:
-        req = urllib2.Request(url)
+        if VERBOSE:
+            if headers:
+                print(headers)
+                hdr_s = ' '.join('-H "%s: %s"' % (k, v) for k, v in headers.iteritems())
+            else:
+                hdr_s = ''
+            print('curl -X%s -D - -o/dev/null -s %s "%s"' % (method, hdr_s, url))
+        req = urllib.request.Request(url)
         if headers:
             for header in headers:
                 req.add_header(header, headers[header])
 
         req.get_method = lambda: method
         if data:
-            res = urllib2.urlopen(req, data)
+            res = urllib.request.urlopen(req, data)
         else:
-            res = urllib2.urlopen(req)
+            res = urllib.request.urlopen(req)
 
         out = res.read()
         out = out + res.read()
@@ -33,10 +40,10 @@ def request(method, url, headers, data):
             print("code: ", rc, " recv: '", out, "'")
 
         if rc != 500:
-            return (rc, out, res.info().dict)
+            return (rc, out, res.info())
 
         return (rc, False, False)
-    except urllib2.HTTPError as e:
+    except urllib.error.HTTPError as e:
         if e.code == 400:
             out = e.read();
 
