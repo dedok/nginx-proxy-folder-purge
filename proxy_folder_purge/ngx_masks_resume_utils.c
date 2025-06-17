@@ -335,7 +335,7 @@ ngx_masks_prepare_paths(ngx_masks_storage_t *ms, ngx_array_t *paths,
     unsigned         checkpoint_len;
     ngx_str_t        dir_name, *dn;
 
-    prepared_paths = ngx_array_create(ms->pool, 16, sizeof(ngx_str_t));
+    prepared_paths = ngx_array_create(ms->temp_pool, 16, sizeof(ngx_str_t));
     if (prepared_paths == NULL) {
         goto oom;
     }
@@ -415,7 +415,7 @@ oom:
 
 
 /** Select new mask per  */
-ngx_full_mask_t*
+ngx_mask_row_t*
 ngx_masks_push_purge_mask(ngx_masks_storage_t *ms, ngx_str_t *domain)
 {
 #ifdef uthash_nonfatal_oom
@@ -432,11 +432,11 @@ ngx_masks_push_purge_mask(ngx_masks_storage_t *ms, ngx_str_t *domain)
     }
 
     /* This domain is encountered for the first time */
-    q = ngx_palloc(ms->pool, sizeof(ngx_masks_purge_queue_t));
+    q = ngx_palloc(ms->temp_pool, sizeof(ngx_masks_purge_queue_t));
     if (q == NULL) {
         return NULL;
     }
-    q->domain.data = ngx_palloc(ms->pool, domain->len + 1);
+    q->domain.data = ngx_palloc(ms->temp_pool, domain->len + 1);
     if (q->domain.data == NULL) {
         return NULL;
     }
@@ -446,8 +446,8 @@ ngx_masks_push_purge_mask(ngx_masks_storage_t *ms, ngx_str_t *domain)
     q->domain.data[domain->len] = 0;
 
     /* Initialize list */
-    rc = ngx_list_init(&q->purge_urls, ms->pool, 1,
-                       sizeof(ngx_full_mask_t));
+    rc = ngx_list_init(&q->purge_urls, ms->temp_pool, 1,
+                       sizeof(ngx_mask_row_t));
     if (rc != NGX_OK) {
         return NULL;
     }

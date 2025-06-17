@@ -36,9 +36,6 @@ typedef struct {
 
 typedef struct {
     ngx_masks_storage_t           *masks;
-    ngx_cycle_t                   *cycle;
-    ngx_event_t                   *ev;
-
     /** Purge urls to apply to current domain */
     ngx_list_t                    *purge_urls;
 } ngx_remove_file_ctx_t;
@@ -59,6 +56,8 @@ static char *ngx_masks_storage_conf(ngx_conf_t *cf, ngx_command_t *cmd,
 static char *ngx_masks_storage_merge_loc_conf(ngx_conf_t *cf, void *parent,
         void *child);
 static void *ngx_masks_storage_create_loc_conf(ngx_conf_t *cf);
+static ngx_int_t ngx_masks_storage_prepare_purger_queue(ngx_masks_storage_t *m,
+        ngx_str_t *dirname);
 
 static ngx_masks_storage_t *ngx_masks_storage_init(ngx_conf_t *cf,
         ngx_str_t *shared_memory_size, size_t max_allowed_masks_per_domain);
@@ -72,13 +71,20 @@ static ngx_int_t ngx_masks_storage_purger_add_mask(
         time_t purge_start_time, ngx_int_t is_restoring);
 static ngx_int_t ngx_masks_storage_read_purger_queue(
         ngx_masks_storage_t *ms, u_char *filename);
-static ngx_int_t ngx_remove_file(void *ctx_,
+static ngx_int_t ngx_masks_storage_purge_file(void *ctx_,
         ngx_masks_fs_walker_ctx *entry);
 static ngx_int_t ngx_masks_storage_old_purger_file(
     ngx_masks_storage_t *m, ngx_str_t *dirname, DIR *dp, char **files);
 static ngx_int_t ngx_masks_storage_remove_purger_file(
         ngx_masks_storage_t *m, ngx_str_t *dirname);
 static ngx_int_t ngx_masks_storage_get_pid(u_char *path);
+
+static int fnmatch_adapter(ngx_pool_t *pool, ngx_log_t *log,
+        ngx_str_t *pattern, ngx_str_t *url);
+static ngx_str_t make_domain_key(ngx_pool_t *pool, ngx_str_t *cache_path,
+        ngx_str_t *domain);
+static void parse_domain_key(ngx_str_t *b, ngx_str_t *cache_path,
+        ngx_str_t *domain);
 
 
 static ngx_command_t ngx_masks_storage_commands[] = {
@@ -171,7 +177,7 @@ compare_and_set_argv(ngx_str_t *arg, const char *prefix,
 /**
  * Returns non-zero if specified string value should be treated as false
  */
-static int
+static inline int
 ngx_masks_conf_str_is_false(ngx_str_t *cv)
 {
 #define CVCMP(x) \
@@ -314,7 +320,7 @@ ngx_masks_storage_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         --tmp.len;
     }
 
-    ms->path->purger_ = -1;
+    ms->path->background_purger = -1;
     ms->path->data = (void *) ms;
     ms->path->conf_file = cf->conf_file->file.name.data;
     ms->path->line = cf->conf_file->line;
@@ -354,13 +360,12 @@ ngx_masks_storage_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ms->tmp_path->loader = NULL;
     ms->tmp_path->purger = NULL;
 
-    ms->tmp_path->purger_ = -1;
     ms->tmp_path->data = (void *) ms;
     ms->tmp_path->conf_file = cf->conf_file->file.name.data;
     ms->tmp_path->line = cf->conf_file->line;
     ms->tmp_path->name.len = sizeof("logs") - 1;
     ms->tmp_path->name.data = ngx_pcalloc(cf->pool, ms->tmp_path->name.len);
-    if (!ms->tmp_path->name.data) {
+    if (ms->tmp_path->name.data == NULL) {
         return NGX_CONF_ERROR;
     }
 
@@ -615,7 +620,8 @@ error_exit:
  * @return NULL on success or statically-allocated error message on failure
  */
 static const char*
-parse_mask_line(ngx_masks_storage_t *ms, u_char *start, u_char *eol, ngx_full_mask_t *mask)
+parse_mask_line(ngx_masks_storage_t *ms, u_char *start, u_char *eol,
+        ngx_mask_row_t *row)
 {
     ngx_int_t rc;
     uint32_t crc32;
@@ -646,12 +652,12 @@ parse_mask_line(ngx_masks_storage_t *ms, u_char *start, u_char *eol, ngx_full_ma
         return "CRC32 is not a number";
     }
 
-    mask->crc32 = (uint32_t) rc;
+    row->crc32 = (uint32_t) rc;
 
     /* Validate checksum */
     p = separator + 1;
     crc32 = ngx_crc32_long(p, eol - p);
-    if (crc32 != mask->crc32) {
+    if (crc32 != row->crc32) {
         return "CRC32 check failed";
     }
 
@@ -661,8 +667,8 @@ parse_mask_line(ngx_masks_storage_t *ms, u_char *start, u_char *eol, ngx_full_ma
     if (separator == NULL) {
         return "can't find a domain";
     }
-    mask->domain.data = p;
-    mask->domain.len = separator - p;
+    row->domain.data = p;
+    row->domain.len = separator - p;
 
     /* pattern or mask */
     p = separator + 1;
@@ -670,13 +676,13 @@ parse_mask_line(ngx_masks_storage_t *ms, u_char *start, u_char *eol, ngx_full_ma
     if (separator == NULL) {
         return "can't find a pattern, e.g. mask";
     }
-    mask->mask.mask.data = p;
-    mask->mask.mask.len = separator - p;
+    row->mask.mask.data = p;
+    row->mask.mask.len = separator - p;
 
     /* timestamp */
     p = separator + 1;
-    mask->mask.purge_start_time = ngx_atotm(p, eol /* \n */ - p);
-    if (mask->mask.purge_start_time == NGX_ERROR) {
+    row->mask.purge_start_time = ngx_atotm(p, eol /* \n */ - p);
+    if (row->mask.purge_start_time == NGX_ERROR) {
         return "timestamp is not a number";
     }
 
@@ -695,7 +701,7 @@ ngx_deserialize_mask(ngx_masks_storage_t *ms, u_char *it,
     ngx_int_t lineno, rc;
     u_char *start, *eol;
     const char *err;
-    ngx_full_mask_t tmp;
+    ngx_mask_row_t tmp;
 
     for (start = it, lineno = 1; start < end; lineno++, start = eol + 1) {
 
@@ -913,18 +919,17 @@ ngx_masks_storage_init(ngx_conf_t *cf, ngx_str_t *shared_memory_size,
     ngx_uint_t                   n;
 
     ctx = ngx_pcalloc(cf->pool, sizeof(ngx_masks_storage_t));
-
-    if (!ctx) {
-        return NULL;
-    }
-
-    ctx->path = ngx_pcalloc(cf->pool, sizeof(ngx_path_t));
-    if (ctx->path == NULL) {
+    if (ctx == NULL) {
         return NULL;
     }
 
     ctx->tmp_path = ngx_pcalloc(cf->pool, sizeof(ngx_path_t));
     if (ctx->tmp_path == NULL) {
+        return NULL;
+    }
+
+    ctx->path = ngx_pcalloc(cf->pool, sizeof(ngx_path_t));
+    if (ctx->path == NULL) {
         return NULL;
     }
 
@@ -1532,8 +1537,8 @@ ngx_masks_storage_restore_from_file(ngx_masks_storage_t *ms,
 
     size = ngx_file_size(&fi);
 
-    start = ngx_palloc(ms->pool, size);
-    if (!start) {
+    start = ngx_alloc(size, ngx_cycle->log);
+    if (start == NULL) {
         goto exit;
     }
 
@@ -1564,7 +1569,7 @@ ngx_masks_storage_restore_from_file(ngx_masks_storage_t *ms,
 
 exit:
     if (start) {
-        ngx_pfree(ms->pool, start);
+        ngx_free(start);
     }
 
     (void) ngx_close_file(file.fd);
@@ -1751,7 +1756,7 @@ ngx_masks_storage_foreach(ngx_masks_storage_t *ms,
 /** }}} */
 
 
-/** PURGE HTTP API an entry point {{{ */
+/** PURGE HTTP API an entry point [[[ */
 static ngx_int_t
 ngx_http_cache_purge_folder_writer(void *ctx, ngx_mask_t *mask,
     ngx_str_t *domain)
@@ -1761,7 +1766,7 @@ ngx_http_cache_purge_folder_writer(void *ctx, ngx_mask_t *mask,
     ngx_chain_t                              *cl;
     ngx_buf_t                                *b;
     ngx_temp_file_t                          *tf;
-    ssize_t                                   size, n;
+    ssize_t                                   n, size;
 
     fw_ctx = (ngx_http_cache_purge_folder_writer_ctx_t *) ctx;
     pool = fw_ctx->r->pool;
@@ -1836,6 +1841,7 @@ ngx_http_cache_purge_folder_writer_format(
     }
     tf->offset += n;
 
+
     ngx_pfree(pool, b->start);
     ngx_pfree(pool, b);
     cl->buf = NULL;
@@ -1850,12 +1856,12 @@ ngx_http_cache_purge_folder_dump_shared_memory(ngx_http_request_t *r)
 {
     /** TODO: optimise, limit, offset */
 
-    ngx_masks_storage_loc_conf_t         *conf;
+    ngx_masks_storage_loc_conf_t             *conf;
     ngx_int_t                                 rc;
     ngx_chain_t                               out;
     ngx_http_cache_purge_folder_writer_ctx_t  ctx;
-    ngx_temp_file_t                          *tf;
     ngx_buf_t                                *b;
+    ngx_temp_file_t                          *tf;
     off_t                                     size, start;
 
     conf = ngx_http_get_module_loc_conf(r, ngx_masks_storage_module);
@@ -1889,6 +1895,7 @@ ngx_http_cache_purge_folder_dump_shared_memory(ngx_http_request_t *r)
                 "failed");
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
+
     start = tf->offset;
 
     rc = ngx_masks_storage_foreach(conf->masks_storage, (void *) &ctx,
@@ -1902,6 +1909,7 @@ ngx_http_cache_purge_folder_dump_shared_memory(ngx_http_request_t *r)
     if (tf->offset > start) {
         tf->offset--;
     }
+
     rc = ngx_http_cache_purge_folder_writer_format(&ctx, "]", sizeof("]") - 1);
     if (rc == NGX_ERROR) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -1939,7 +1947,6 @@ ngx_http_cache_purge_folder_dump_shared_memory(ngx_http_request_t *r)
     b->in_file = 1;
     b->last_buf = 1;
     b->last_in_chain = 1;
-
     b->file->fd = tf->file.fd;
     b->file->name = tf->path->name;
     b->file->log = r->connection->log;
@@ -1979,93 +1986,6 @@ ngx_http_cache_purge_folder_flush(ngx_http_request_t *r)
     }
 
     return NGX_HTTP_OK;
-}
-
-
-static int
-fnmatch_adapter(ngx_pool_t *pool, ngx_log_t *log,
-        ngx_str_t *pattern, ngx_str_t *url)
-{
-    int   ret;
-    char *p, *u, *e;
-
-    if (pool == NULL || pattern == NULL || url == NULL) {
-        return -1;
-    }
-
-    p = ngx_palloc(pool, pattern->len + 1);
-    if (p == NULL) {
-        return -1;
-    }
-    e = (char *) ngx_copy(p, pattern->data, pattern->len);
-    *e++ = '\0';
-
-    u = ngx_palloc(pool, url->len + 1);
-    if (u == NULL) {
-        return -1;
-    }
-    e = (char *) ngx_copy(u, url->data, url->len);
-    *e++ = '\0';
-
-    ret = fnmatch(p, u, 0);
-
-    ngx_log_error(NGX_LOG_INFO, log, 0,
-                "proxy_folder_purge: "
-                "fnmatch: match result %d, pattern = %s ~ url = %s",
-                (int) ret, p, u);
-    return ret;
-}
-
-
-static ngx_str_t
-make_domain_key(ngx_pool_t *pool, ngx_str_t *cache_path, ngx_str_t *domain)
-{
-    ngx_str_t r;
-    u_char    *p;
-
-    ngx_str_set(&r, "");
-
-    if (cache_path->len == 0) {
-        r = *domain;
-        return r;
-    }
-
-    r.len = cache_path->len + (sizeof(":") - 1) + domain->len;
-    r.data = ngx_palloc(pool, r.len);
-    if (r.data == NULL) {
-        r.len = 0;
-        return r;
-    }
-
-    p = ngx_copy(r.data, cache_path->data, cache_path->len);
-    p = ngx_copy(p, ":", sizeof(":") - 1);
-    p = ngx_copy(p, domain->data, domain->len);
-
-    return r;
-}
-
-
-static void
-parse_domain_key(ngx_str_t *b, ngx_str_t *cache_path, ngx_str_t *domain)
-{
-    u_char *p, *e;
-
-    domain->data = (cache_path->data = b->data);
-    domain->len = (cache_path->len = b->len);
-
-    p = b->data;
-    e = b->data + b->len;
-
-    for (; p != e; ++p) {
-
-        if (*p == ':') {
-            ++p;
-            domain->data = p;
-            domain->len = (size_t) (e - p);
-            cache_path->len = cache_path->len - domain->len - 1;
-            return;
-        }
-    }
 }
 
 
@@ -2116,7 +2036,7 @@ ngx_http_foreground_purge(ngx_http_request_t *r,
     conf = ngx_http_get_module_loc_conf(r, ngx_masks_storage_module);
 
     /* The module is off */
-    if (!conf->masks_storage) {
+    if (conf->masks_storage == NULL) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
             "proxy_folder_purge: the module is off for \"%V\"", &r->uri);
         return NGX_DECLINED;
@@ -2195,7 +2115,10 @@ ngx_http_foreground_purge(ngx_http_request_t *r,
                 {
                     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                         "proxy_folder_purge: \"%V\" purged", &r->uri);
+                    /** Renewing: */
                     c->valid_sec = 0;
+                    c->valid_msec = 0;
+                    c->exists = 0;
                     r->upstream->cache_status = NGX_HTTP_CACHE_BYPASS;
                     goto out;
                 }
@@ -2419,10 +2342,11 @@ ngx_http_folder_send_flush_handler(ngx_http_request_t *r)
     ngx_http_finalize_request(r, ngx_http_cache_purge_folder_flush(r));
     return NGX_DONE;
 }
-/**}}}*/
+/** ]]] */
 
-
-/** ngx_masks_storage_core_api.h {{{ */
+/**
+ * Backgournd purge [[[
+ */
 static ngx_int_t
 ngx_masks_storage_purger_add_mask(ngx_masks_storage_t *ms,
     ngx_str_t *unparsed_key, ngx_str_t *mask, time_t purge_start_time,
@@ -2432,7 +2356,7 @@ ngx_masks_storage_purger_add_mask(ngx_masks_storage_t *ms,
 
     ngx_str_t cache_path, domain;
 
-    ngx_full_mask_t *full_mask;
+    ngx_mask_row_t *full_mask;
 
     parse_domain_key(unparsed_key, &cache_path, &domain);
 
@@ -2451,7 +2375,7 @@ ngx_masks_storage_purger_add_mask(ngx_masks_storage_t *ms,
 
     /** Domain */
     full_mask->domain.len = domain.len;
-    full_mask->domain.data = ngx_palloc(ms->pool,
+    full_mask->domain.data = ngx_palloc(ms->temp_pool,
             sizeof(u_char) * domain.len + 1 /* \0 - \0 */);
     if (full_mask->domain.data == NULL) {
         ngx_log_error(NGX_LOG_ERR, ms->log, 0,
@@ -2463,7 +2387,7 @@ ngx_masks_storage_purger_add_mask(ngx_masks_storage_t *ms,
 
     /** Mask */
     full_mask->mask.mask.len = mask->len;
-    full_mask->mask.mask.data = ngx_palloc(ms->pool,
+    full_mask->mask.mask.data = ngx_palloc(ms->temp_pool,
             sizeof(u_char) * mask->len + 1 /* \0 - \0 */);
     if (full_mask->mask.mask.data == NULL) {
         ngx_log_error(NGX_LOG_ERR, ms->log, 0,
@@ -2486,7 +2410,7 @@ ngx_masks_storage_purger_queue_free_part(ngx_masks_storage_t *ms,
         ngx_str_t *cache_path, ngx_list_part_t *part)
 {
     ngx_uint_t                   i;
-    ngx_full_mask_t             *fm;
+    ngx_mask_row_t             *fm;
     ngx_domain_rbtree_node_t    *n;
     ngx_rbtree_node_t           *node;
     ngx_slab_pool_t             *shpool;
@@ -2513,7 +2437,7 @@ ngx_masks_storage_purger_queue_free_part(ngx_masks_storage_t *ms,
 
         ngx_shmtx_lock(&shpool->mutex);
 
-        domain = make_domain_key(ms->pool, cache_path, &fm[i].domain);
+        domain = make_domain_key(ms->temp_pool, cache_path, &fm[i].domain);
 
         node = (ngx_rbtree_node_t *)
             ngx_str_rbtree_lookup(ms->sh->rbtree, &domain, ngx_crc32_long(
@@ -2549,7 +2473,7 @@ ngx_masks_storage_purger_queue_free_part(ngx_masks_storage_t *ms,
             ngx_log_error(NGX_LOG_INFO, ms->log, 0,
                 "proxy_folder_purge: compare sh = \"%V\" ~ mask = \"%V\", "
                 "is equal = %s, ref_count = %d",
-                masksh, mask, (rc == NGX_DECLINED) ? "yes" : "no",
+                masksh, mask, (rc != NGX_DECLINED) ? "yes" : "no",
                 (ngx_int_t) mask_queue->mask.ref_count);
 
             if (rc == NGX_DECLINED) {
@@ -2590,7 +2514,6 @@ ngx_masks_storage_purger_queue_free_part(ngx_masks_storage_t *ms,
 shmtx_unlock:
         ngx_shmtx_unlock(&shpool->mutex);
     }
-
 }
 
 
@@ -2609,6 +2532,11 @@ ngx_masks_storage_purger_queue_free(ngx_masks_storage_t *ms)
     HASH_CLEAR(hh, ms->per_domain_purge_masks);
 
     ms->per_domain_purge_masks = NULL;
+
+    if (ms->temp_pool) {
+        ngx_destroy_pool(ms->temp_pool);
+        ms->temp_pool = NULL;
+    }
 }
 
 
@@ -2651,8 +2579,8 @@ ngx_masks_storage_read_purger_queue(ngx_masks_storage_t *ms,
 
     size = ngx_file_size(&fi);
 
-    start = ngx_palloc(ms->pool, size);
-    if (!start) {
+    start = ngx_alloc(size, ms->log);
+    if (start == NULL) {
         goto exit;
     }
 
@@ -2684,7 +2612,7 @@ ngx_masks_storage_read_purger_queue(ngx_masks_storage_t *ms,
 
 exit:
     if (start) {
-        ngx_pfree(ms->pool, start);
+        ngx_free(start);
     }
 
     if (ngx_close_file(file.fd) == NGX_FILE_ERROR) {
@@ -2701,67 +2629,8 @@ exit:
 }
 
 
-/**
- * Dump handler called then we wish to slow down
- * disk scanning.
- */
-static void
-ngx_dumb_timer(ngx_event_t *ev)
-{
-    return;
-}
-
-
-static void
-ngx_background_purge_slowdown(ngx_masks_storage_t *m,
-    ngx_cycle_t *cycle, ngx_event_t *ev)
-{
-    ngx_msec_t                      elapsed;
-    ngx_int_t                       do_sleep;
-    ngx_connection_t                dumb_con;
-
-    ngx_time_update();
-
-    do_sleep = 0;
-
-    if (++m->processed_files >= m->background_purger_files) {
-        do_sleep = 1;
-
-    } else {
-
-        elapsed = ngx_abs((ngx_msec_int_t) (ngx_current_msec - m->last));
-
-        if (m->background_purger_threshold > 0 &&
-            elapsed >= m->background_purger_threshold)
-        {
-            do_sleep = 1;
-        }
-    }
-
-    if (do_sleep) {
-
-        ngx_log_error(NGX_LOG_INFO, m->log, 0,
-                "proxy_folder_purge: slowdown for %T msec, last slowdown = %T",
-                m->background_purger_sleep, m->last);
-
-        ngx_memzero(&dumb_con, sizeof(ngx_connection_t));
-        ev->handler = ngx_dumb_timer;
-        ev->log = m->log;
-        ev->data = &dumb_con;
-        dumb_con.fd = (ngx_socket_t) -1;
-
-        ngx_add_timer(ev, m->background_purger_sleep);
-        ngx_process_events_and_timers(cycle);
-
-        m->last = ngx_current_msec;
-        m->processed_files = 0;
-    }
-}
-
-
-/** Filename is always NUL-terminated */
 static ngx_int_t
-ngx_remove_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
+ngx_masks_storage_purge_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
 {
     static u_char cache_key[] = { LF, 'K', 'E', 'Y', ':', ' ' };
     static size_t header_size = sizeof(ngx_http_file_cache_header_t)
@@ -2774,26 +2643,24 @@ ngx_remove_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
     ngx_int_t                         fd, rc;
     u_char                            buf[sizeof(ngx_http_file_cache_header_t)
                                          + sizeof(cache_key) + 2 * 4096]
-                                            __attribute__((aligned(sizeof(ngx_uint_t))));
-    u_char                           *buf_start, *buf_end,
+                                         __attribute__((aligned(sizeof(ngx_uint_t))));
+    u_char                           *buf_start,
+                                     *buf_end,
                                      *url_start,
                                      *url_end;
     ngx_http_file_cache_header_t     *h;
-    ngx_full_mask_t                  *mask, *fm;
+    ngx_mask_row_t                   *row,
+                                     *fm;
     ngx_uint_t                        buf_size;
     ngx_uint_t                        i;
     ngx_list_part_t                  *part;
-    ngx_cycle_t                      *cycle;
-    ngx_event_t                      *ev;
-
+    ngx_msec_t                        elapsed;
 
     fd = -1;
     m = ctx->masks;
-    cycle = ctx->cycle;
-    ev = ctx->ev;
 
     ngx_log_error(NGX_LOG_INFO, m->log, 0,
-        "proxy_folder_purge: ngx_remove_file: at file \"%s\"",
+        "proxy_folder_purge: ngx_masks_storage_purge_file: at file \"%s\"",
         entry->full_path);
 
     rc = NGX_OK;
@@ -2801,8 +2668,9 @@ ngx_remove_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
     fd = openat(entry->cfd, entry->e_name, O_RDWR | O_SYNC | O_NOFOLLOW);
     if (fd == -1) {
         ngx_log_error(NGX_LOG_INFO, m->log, ngx_errno,
-                "proxy_folder_purge: ngx_remove_file: can't open a file "
-                "\"%s\". Possible that nginx's cache manger did a remove",
+                "proxy_folder_purge: ngx_masks_storage_purge_file: "
+                "can't open a file \"%s\". Possible that nginx's cache "
+                "manger did a remove",
                 entry->full_path);
         return NGX_OK;
     }
@@ -2820,8 +2688,8 @@ ngx_remove_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
     if (rc == -1 || rc < (off_t) header_size) {
 
         ngx_log_error(NGX_LOG_INFO, m->log, ngx_errno,
-                "proxy_folder_purge: ngx_remove_file: can't read a file "
-                "\"%s\", rc = %d, hs = %d",
+                "proxy_folder_purge: ngx_masks_storage_purge_file: "
+                "can't read a file \"%s\", rc = %d, hs = %d",
                 entry->full_path, rc, (ngx_int_t) header_size);
         rc = NGX_ABORT;
         goto exit;
@@ -2835,12 +2703,7 @@ ngx_remove_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
     rc = NGX_OK;
 
     if (h->version != NGX_HTTP_CACHE_VERSION) {
-        /** This will be deleted by nginx */
-        ngx_log_error(NGX_LOG_ERR, m->log, 0,
-                "proxy_folder_purge: ngx_remove_file: "
-                "cache file \"%s\" version mismatch",
-                entry->full_path);
-        /** NGX_OK */
+        /** This will be deleted by nginx itself */
         rc = NGX_OK;
         goto exit;
     }
@@ -2884,11 +2747,10 @@ ngx_remove_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
     }
 
     if (url_start == NULL || url_end == NULL) {
-
         ngx_log_error(NGX_LOG_ERR, m->log, 0,
-            "proxy_folder_purge: ngx_remove_file: can't find an url in the key "
-            "at \"%s\", skiping", entry->full_path);
-        /** NGX_OK */;
+            "proxy_folder_purge: ngx_masks_storage_purge_file: "
+            "can't find an url in the key at \"%s\", skiping",
+            entry->full_path);
         rc = NGX_OK;
         goto exit;
     }
@@ -2913,7 +2775,7 @@ ngx_remove_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
             i = 0;
         }
 
-        mask = &fm[i];
+        row = &fm[i];
 
         ngx_log_error(NGX_LOG_INFO, m->log, 0,
                 "proxy_folder_purge: "
@@ -2922,22 +2784,23 @@ ngx_remove_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
                 "domain = \"%V\", "
                 "h->date = %d ~ purge_start_time = %d",
                 entry->full_path,
-                &url, &mask->mask.mask,
-                &mask->domain, &domain,
-                (ngx_int_t) h->date, (ngx_int_t) mask->mask.purge_start_time);
+                &url, &row->mask.mask,
+                &row->domain, &domain,
+                (ngx_int_t) h->date, (ngx_int_t) row->mask.purge_start_time);
 
-        if (domain.len != 0 && !(mask->domain.len == domain.len
-                && ngx_strncmp(mask->domain.data, domain.data, domain.len)
+        if (domain.len != 0 && !(row->domain.len == domain.len
+                && ngx_strncmp(row->domain.data, domain.data, domain.len)
                     == 0))
         {
             continue;
         }
 
-        if (fnmatch_adapter(m->pool, m->log, &mask->mask.mask, &url) != 0) {
+        if (fnmatch_adapter(m->temp_pool, m->log, &row->mask.mask, &url) != 0) {
             continue;
         }
 
-        if (h->date > mask->mask.purge_start_time) {
+        if (h->date > row->mask.purge_start_time) {
+            /** Should NOT be expired */
             goto exit;
         }
 
@@ -2945,13 +2808,14 @@ ngx_remove_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
                 "proxy_folder_purge: delete a file = \"%s\" "
                 "url = \"%V\"", entry->full_path, &url);
 
+        /** TODO: update cache->fs_size and cache->queue,
+         * else it would be updated unpredictable by cache manager */
         if (unlinkat(entry->cfd, entry->e_name, 0) == -1) {
             ngx_log_error(NGX_LOG_WARN, m->log, ngx_errno,
                     "proxy_folder_purge: can't remove a file \"%s\"",
                     entry->full_path);
             /** NOTE
-             * Do not break, even if removal is not possible for some
-             * reasons.
+             * Do not break, even if removal is failed.
              */
         }
 
@@ -2967,49 +2831,44 @@ exit:
     /** Master has been restarted or terminated.
      */
     if (ngx_quit || ngx_terminate) {
-        m->walk_tree_failed = 1;
         return NGX_ABORT;
     }
 
-    ngx_background_purge_slowdown(m, cycle, ev);
+    ngx_time_update();
 
-    ++m->processed_files;
+    if (++m->processed_files >= m->background_purger_files) {
+        (void) usleep(1000);
+    } else {
+
+        elapsed = ngx_abs((ngx_msec_int_t) (ngx_current_msec - m->last));
+
+        if (m->background_purger_threshold > 0
+            && elapsed >= m->background_purger_threshold)
+        {
+            (void) usleep(1000);
+            m->last = ngx_current_msec;
+        }
+    }
 
     return rc;
 }
 
 
 ngx_int_t
-ngx_masks_storage_purger_is_off(void *ms)
-{
-    ngx_masks_storage_t *m = (ngx_masks_storage_t *) ms;
-
-    if (m == NULL || m->background_purger_off == 1) {
-        return NGX_OK;
-    }
-
-    return NGX_DECLINED;
-}
-
-/**
- * Background Purge [[[
- */
-ngx_int_t
 ngx_masks_storage_background_purge_init(ngx_cycle_t *cycle, void *ms,
-        ngx_pool_t *pool, ngx_log_t *log, ngx_str_t *dirname)
+        ngx_str_t *dirname)
 {
     ngx_masks_storage_t *m = (ngx_masks_storage_t *) ms;
 
-    if (ms == NULL
-            || pool == NULL
-            || log == NULL
-            || dirname == NULL)
+    if (cycle == NULL
+        || ms == NULL
+        || dirname == NULL)
     {
         return NGX_ERROR;
     }
 
-    m->log = log;
-    m->pool = pool;
+    m->log = cycle->log;
+    m->temp_pool = NULL;
 
     if (ngx_masks_storage_acquire_lock_file(cycle, m, dirname) != NGX_OK) {
         return NGX_ERROR;
@@ -3019,7 +2878,9 @@ ngx_masks_storage_background_purge_init(ngx_cycle_t *cycle, void *ms,
 }
 
 
-/** Attempts to save checkpoint. Any errors are silently ignored. */
+/**
+ * Attempts to save checkpoint. Any errors are silently ignored.
+ */
 static void
 save_checkpoint(void *data, const char *checkpoint)
 {
@@ -3029,11 +2890,11 @@ save_checkpoint(void *data, const char *checkpoint)
     ngx_masks_save_checkpoint(ck);
 }
 
-
+/**
+ * Main loop & logic of the background purge
+ */
 ngx_msec_t
-ngx_masks_storage_background_purge(void *ms, ngx_pool_t *pool,
-        ngx_log_t *log, ngx_str_t *dirname, ngx_cycle_t *cycle,
-        ngx_event_t *ev)
+ngx_masks_storage_background_purge(void *ms, ngx_str_t *dirname)
 {
     ngx_masks_storage_t              *m = (ngx_masks_storage_t *) ms;
 
@@ -3046,29 +2907,36 @@ ngx_masks_storage_background_purge(void *ms, ngx_pool_t *pool,
     const char                       *checkpoint;
     ngx_str_t                         domain;
 
-    if (ms == NULL || pool == NULL || log == NULL) {
-        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-            "proxy_folder_purge: invalid pointer ms = %p, poll = %p, log = %p",
-            ms, pool, log);
-        goto out;
+    if (m == NULL) {
+        return 60 * 1000;
     }
 
-    m->log = log;
-    m->pool = pool;
+    if (m->background_purger_off == 1) {
+        ngx_log_error(NGX_LOG_INFO, m->log, 0,
+                "background purge process: is off by configuration, yielding "
+                "or is _NOT_ init correctly");
+        return 60 * 1000;
+    }
+
+    rc = ngx_masks_storage_prepare_purger_queue(ms, dirname);
+    if (rc != NGX_OK) {
+        ngx_log_error(NGX_LOG_NOTICE, m->log, 0,
+                "background purge process: prepare queue waiting with status "
+                "\'%s\'",
+                (rc != NGX_DECLINED ? "failed": "no incomming purges"));
+        return 6 * 1000;
+    }
 
     path = ngx_cycle->paths.elts;
 
     m->removed_files = 0;
     m->processed_files = 0;
-    m->walk_tree_failed = 0;
     m->last = 0;
     m->start_time = ngx_time();
 
     rm_ctx.masks = m;
-    rm_ctx.cycle = cycle;
-    rm_ctx.ev = ev;
 
-    ck = ngx_masks_load_checkpoint(dirname, pool, m->masks_sha1);
+    ck = ngx_masks_load_checkpoint(dirname, m->temp_pool, m->masks_sha1);
     if (ck == NULL) {
         ngx_log_error(NGX_LOG_ERR, m->log, 0,
                       "proxy_folder_purge: unable to load checkpoint");
@@ -3091,7 +2959,7 @@ ngx_masks_storage_background_purge(void *ms, ngx_pool_t *pool,
      */
     for (i = 0; i < roots->nelts; i++) {
 
-        ngx_log_error(NGX_LOG_INFO, log, 0,
+        ngx_log_error(NGX_LOG_INFO, m->log, 0,
                 "proxy_folder_purge: working on path = \"%V\"",
                 &path[i]);
 
@@ -3101,9 +2969,12 @@ ngx_masks_storage_background_purge(void *ms, ngx_pool_t *pool,
         domain = ngx_masks_get_domain_from_path(&path[i]);
 
         rm_ctx.purge_urls = ngx_masks_get_per_domain_purge_queue(ms, &domain);
+        if (rm_ctx.purge_urls == NULL) {
+            continue;
+        }
 
         rc = ngx_masks_walk_fs((char*) path[i].data, checkpoint,
-                                ngx_remove_file, &rm_ctx,
+                                ngx_masks_storage_purge_file, &rm_ctx,
                                 save_checkpoint, ck);
 
         /* checkpoint only affects the very first entry */
@@ -3114,14 +2985,6 @@ ngx_masks_storage_background_purge(void *ms, ngx_pool_t *pool,
                     "proxy_folder_purge: can't read a path = \"%V\"",
                     &path[i]);
         } else if (rc == NGX_ABORT || rc == NGX_DECLINED) {
-
-            if (!m->walk_tree_failed) {
-                ngx_log_error(NGX_LOG_ERR, m->log, ngx_errno,
-                    "proxy_folder_purge: can't purge a file, request failed "
-                    "probably process is interupted by purge");
-                continue;
-            }
-
             break;
         }
     } /* for */
@@ -3159,7 +3022,7 @@ ngx_masks_storage_background_purge(void *ms, ngx_pool_t *pool,
 out:
     ngx_masks_storage_purger_queue_free(m);
 
-    return PURGER_DEFAULT_NEXT;
+    return m->background_purger_sleep;
 }
 
 
@@ -3203,6 +3066,11 @@ ngx_masks_storage_old_purger_file(ngx_masks_storage_t *m,
 }
 
 
+/**
+ * This function scans full directory to find .purge files.
+ * Where is a possibility that a few .purge-files would be existed,
+ * ex: background purge went down unexpectly.
+ */
 static ngx_int_t
 ngx_masks_storage_remove_purger_file(ngx_masks_storage_t *m,
     ngx_str_t *dirname)
@@ -3285,12 +3153,10 @@ ngx_masks_storage_get_pid(u_char *path)
 }
 
 
-ngx_int_t
-ngx_masks_storage_prepare_purger_queue(void *ms, ngx_pool_t *pool,
-        ngx_log_t *log, ngx_str_t *dirname)
+static ngx_int_t
+ngx_masks_storage_prepare_purger_queue(ngx_masks_storage_t *m,
+        ngx_str_t *dirname)
 {
-    ngx_masks_storage_t *m = (ngx_masks_storage_t *) ms;
-
     DIR             *dirp;
     ngx_int_t        rc;
     u_char           full_path[PATH_MAX + 1];
@@ -3300,17 +3166,16 @@ ngx_masks_storage_prepare_purger_queue(void *ms, ngx_pool_t *pool,
     ngx_int_t        cnt;
     char           **names, *name;
 
-    if (ms == NULL || pool == NULL || log == NULL) {
-        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-            "proxy_folder_purge: invalid pointer ms = %p, poll = %p, log = %p",
-            ms, pool, log);
+    if (m == NULL) {
+        return NGX_ERROR;
+    }
+
+    m->temp_pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, m->log);
+    if (m->temp_pool == NULL) {
         return NGX_ERROR;
     }
 
     cnt = 0;
-    m->log = log;
-    m->pool = pool;
-
     dirn = get_dirname(dirname);
 
     ngx_snprintf(m->purger_filename, sizeof(m->purger_filename),
@@ -3329,7 +3194,7 @@ ngx_masks_storage_prepare_purger_queue(void *ms, ngx_pool_t *pool,
         goto error;
     }
 
-    names = ngx_masks_load_sorted_filenames(dirp, m->pool);
+    names = ngx_masks_load_sorted_filenames(dirp, m->temp_pool);
     if (names == NULL) {
         ngx_log_error(NGX_LOG_WARN, m->log, 0,
             "proxy_folder_purge: OOM while loading list of files from = \"%s\"",
@@ -3340,16 +3205,12 @@ ngx_masks_storage_prepare_purger_queue(void *ms, ngx_pool_t *pool,
     /* Try to load "already processing" masks list */
     rc = ngx_masks_storage_old_purger_file(m, dirname, dirp, names);
     if (rc > 0) {
-
         return NGX_OK;
-
     } else if (rc < 0) {
-
-        ngx_log_error(NGX_LOG_WARN, m->log, 0,
+        ngx_log_error(NGX_LOG_ERR, m->log, 0,
                       "proxy_folder_purge: can't handle old purger file "
                       "in directory = \"%s\"",
                       dirn);
-        goto error;
     }
 
     ngx_sha1_init(&m->masks_sha1_state);
@@ -3411,17 +3272,93 @@ error:
     return NGX_ERROR;
 }
 
+/** ]]] */
 
-ngx_msec_t
-ngx_masks_storage_purger_sleep(void *ms)
+/** Utils [[[ */
+static int
+fnmatch_adapter(ngx_pool_t *pool, ngx_log_t *log,
+        ngx_str_t *pattern, ngx_str_t *url)
 {
-    ngx_masks_storage_t *m = (ngx_masks_storage_t *) ms;
+    int   ret;
+    char *p, *u, *e;
 
-    if (m == NULL || m->background_purger_sleep == 0) {
-        return MASKS_STORAGE_PURGER_SLEEP_DEFAULT;
+    if (pool == NULL || pattern == NULL || url == NULL) {
+        return -1;
     }
 
-    return m->background_purger_sleep;
+    p = ngx_palloc(pool, pattern->len + 1);
+    if (p == NULL) {
+        return -1;
+    }
+    e = (char *) ngx_copy(p, pattern->data, pattern->len);
+    *e++ = '\0';
+
+    u = ngx_palloc(pool, url->len + 1);
+    if (u == NULL) {
+        return -1;
+    }
+    e = (char *) ngx_copy(u, url->data, url->len);
+    *e++ = '\0';
+
+    ret = fnmatch(p, u, 0);
+
+    ngx_log_error(NGX_LOG_INFO, log, 0,
+                "proxy_folder_purge: "
+                "fnmatch: match result %d, pattern = %s ~ url = %s",
+                (int) ret, p, u);
+    return ret;
+}
+
+
+static ngx_str_t
+make_domain_key(ngx_pool_t *pool, ngx_str_t *cache_path, ngx_str_t *domain)
+{
+    ngx_str_t r;
+    u_char    *p;
+
+    ngx_str_set(&r, "");
+
+    if (cache_path->len == 0) {
+        r = *domain;
+        return r;
+    }
+
+    r.len = cache_path->len + (sizeof(":") - 1) + domain->len;
+    r.data = ngx_palloc(pool, r.len);
+    if (r.data == NULL) {
+        r.len = 0;
+        return r;
+    }
+
+    p = ngx_copy(r.data, cache_path->data, cache_path->len);
+    p = ngx_copy(p, ":", sizeof(":") - 1);
+    p = ngx_copy(p, domain->data, domain->len);
+
+    return r;
+}
+
+
+static void
+parse_domain_key(ngx_str_t *b, ngx_str_t *cache_path, ngx_str_t *domain)
+{
+    u_char *p, *e;
+
+    domain->data = (cache_path->data = b->data);
+    domain->len = (cache_path->len = b->len);
+
+    p = b->data;
+    e = b->data + b->len;
+
+    for (; p != e; ++p) {
+
+        if (*p == ':') {
+            ++p;
+            domain->data = p;
+            domain->len = (size_t) (e - p);
+            cache_path->len = cache_path->len - domain->len - 1;
+            return;
+        }
+    }
 }
 /** ]]] */
 

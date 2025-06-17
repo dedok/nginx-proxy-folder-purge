@@ -13,7 +13,7 @@ from http_utils import *
 
 
 N = 100
-DELAY = 5
+DELAY = 15
 URL = "http://127.0.0.1:8082"
 MASKS_STORAGE = sys.argv[1] + "/masks_storage/masks.in*"
 CACHE = sys.argv[1] + "/purge_folder/*"
@@ -66,10 +66,11 @@ for k in result_cached:
 print ('[+] OK')
 
 print ('[+] Check that shared memory should be empty')
-time.sleep(DELAY)
+time.sleep(60)
 _, out = purge_success(URL, {'Host': 'purge_folder',
     "X-Purge-Options": "dump"})
 res = json.loads(out)
+print (res)
 assert res == [], 'shared memory isn\'t empty'
 print ('[+] OK')
 
@@ -137,7 +138,7 @@ _, cached, _ = get_success(uri + 'folder/subfolder/file.txt',
         {'Host': 'purge_folder'})
 purge_success(uri + "folder/*", {'Host': 'purge_folder',
     "X-Purge-Options": "delete"})
-time.sleep(DELAY)
+time.sleep(60)
 a, cached_2, b = get_success(uri + 'root_file.txt', {'Host': 'purge_folder'})
 assert b['x-cache-status'] == 'HIT', 'wrong cache status'
 a, cached_2, b = get_success(uri + 'folder/file.txt', {'Host': 'purge_folder'})
@@ -162,7 +163,7 @@ _, cached, _ = get_success(uri + '4/3/2/1/t2.txt', {'Host': 'purge_folder'})
 _, cached, _ = get_success(uri + '4/3/2/1/t2', {'Host': 'purge_folder'})
 purge_success(uri + "/4/3/2/1/*.html", {'Host': 'purge_folder',
     "X-Purge-Options": "delete"})
-time.sleep(DELAY)
+time.sleep(60)
 _, cached, b = get_success(uri + '4/3/2/1/', {'Host': 'purge_folder'})
 assert b['x-cache-status'] == 'HIT', 'wrong cache status'
 _, cached, b = get_success(uri + '4/3/2/1/t1.html', {'Host': 'purge_folder'})

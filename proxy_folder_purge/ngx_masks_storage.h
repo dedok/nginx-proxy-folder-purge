@@ -1,7 +1,6 @@
 
-
 /**
- * (C)
+ * (C) BSDv2
  */
 
 #ifndef NGX_MASKS_STORAGE_H_
@@ -16,7 +15,7 @@
 #include <ngx_sha1.h>
 
 #define HASH_NONFATAL_OOM 1
-#include "uthash.h"
+#include <uthash.h>
 
 
 #define MASKS_STORAGE_DIR     "/masks_storage/"
@@ -30,9 +29,6 @@
 #define MIN_ALLOWED_MASKS     "10"
 #define MIN_ALLOWED_MASKS_NUM \
     ngx_atoi((u_char *) MIN_ALLOWED_MASKS, sizeof(MIN_ALLOWED_MASKS) - 1)
-/** msec 10^-3 of a second */
-#define PURGER_DEFAULT_NEXT 12 * 1000 /** 12 sec */
-
 
 #define MASKS_STORAGE_PURGER_FILES_DEFAULT       100
 #define MASKS_STORAGE_PURGER_SLEEP_DEFAULT       50
@@ -94,9 +90,7 @@ typedef struct {
   ngx_str_t       domain;
   /** a stored mask */
   ngx_mask_t      mask;
-  /** Is the mask already purged? */
-  ngx_int_t       purged:1;
-} ngx_full_mask_t;
+} ngx_mask_row_t;
 
 
 /** A rbtree node */
@@ -169,15 +163,14 @@ typedef struct {
   ngx_masks_purge_queue_t        *per_domain_purge_masks;
   u_char                         purger_filename[PATH_MAX + 1];
 
+  /** */
+  ngx_pool_t                    *temp_pool;
+
   /** References */
   ngx_http_request_t            *r;
   ngx_log_t                     *log;
   ngx_path_t                    *path;
   ngx_path_t                    *tmp_path;
-  ngx_pool_t                    *pool;
-
-  /** The bakground purger {{{ */
-  ngx_flag_t                     walk_tree_failed;
 
   /** stats */
   size_t                         removed_files;
@@ -196,13 +189,6 @@ typedef struct {
 /** PURGE external API {{{ */
 ngx_int_t ngx_http_foreground_purge(ngx_http_request_t *r,
         ngx_http_cache_t *c, time_t now);
-ngx_int_t ngx_http_folder_cache_purge(ngx_http_request_t *r);
-ngx_int_t ngx_http_folder_dump(ngx_http_request_t *r);
-ngx_int_t ngx_http_folder_flush(ngx_http_request_t *r);
-ngx_int_t ngx_http_folder_send_dump_handler(ngx_http_request_t *r);
-ngx_int_t ngx_http_folder_send_flush_handler(ngx_http_request_t *r);
-ngx_int_t ngx_masks_storage_acquire_lock_file(ngx_cycle_t *cycle,
-        ngx_masks_storage_t *m, ngx_str_t *dirname);
 /** }}}*/
 
 #endif /* NGX_MASKS_STORAGE_H_ */

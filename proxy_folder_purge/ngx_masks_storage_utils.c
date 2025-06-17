@@ -93,6 +93,7 @@ ngx_masks_storage_acquire_lock_file(ngx_cycle_t *cycle,
     /* NOTE: we don't close lock descriptor and rely on it being closed when
      *       process exits */
     elapsed = start - now;
+
     ngx_log_error(NGX_LOG_NOTICE, m->log, 0,
                   "Acquired lock on file %s in %u.%03us", lock_path,
                   elapsed / 1000u, elapsed % 1000u);

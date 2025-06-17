@@ -66,7 +66,7 @@ ngx_array_t* ngx_masks_prepare_paths(ngx_masks_storage_t *ms, ngx_array_t *paths
 
 /** Perform ngx_list_push on purge masks queue for specified domain and return
  * pointer to the newly inserted element. */
-ngx_full_mask_t* ngx_masks_push_purge_mask(ngx_masks_storage_t *ms,
+ngx_mask_row_t* ngx_masks_push_purge_mask(ngx_masks_storage_t *ms,
         ngx_str_t *domain);
 
 /** Find purge masks queue for specified domain. */

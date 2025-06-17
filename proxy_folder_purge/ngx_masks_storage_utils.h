@@ -24,26 +24,13 @@
 #include <netdb.h>
 
 
-#if defined F_FULLFSYNC
-# define fullsync(fd) fcntl((fd), F_FULLFSYNC)
-#else
-# define fullsync(fd) (fd)
-#endif
-
-
 #if ! defined(PATH_MAX)
 # define PATH_MAX 4096
 #endif /** PATH_MAX */
 
 
-typedef struct ngx_string_list_arg {
-  u_char *arg_, *end_;
-} ngx_string_list_arg_t;
-
-
 static inline ngx_int_t open_append_only_file(ngx_str_t *file);
 static inline const u_char* get_dirname(ngx_str_t *path);
-static inline ngx_int_t is_dir(u_char *path);
 static inline ngx_int_t is_regular_file(u_char *path);
 static inline ngx_int_t parse_path(ngx_str_t *str, ngx_str_t *path,
     ngx_str_t *rest);
@@ -79,21 +66,6 @@ get_dirname(ngx_str_t *path)
     }
 
     return &dn[0];
-}
-
-
-static inline ngx_int_t
-is_dir(u_char *path)
-{
-    struct stat path_stat;
-
-    if ((access((const char *) path, F_OK) == -1) ||
-            (stat((const char *) path, &path_stat) == -1))
-    {
-        return 0;
-    }
-
-    return S_ISDIR(path_stat.st_mode);
 }
 
 
@@ -192,6 +164,10 @@ char** ngx_masks_load_sorted_filenames(DIR *d, ngx_pool_t *pool);
  */
 char* get_regular_file_with_prefix(DIR *d, char ***names,
         const char *prefix, unsigned prefix_len, struct stat *info);
+
+ngx_int_t ngx_masks_storage_acquire_lock_file(ngx_cycle_t *cycle,
+        ngx_masks_storage_t *m, ngx_str_t *dirname);
+
 
 #endif /* NGX_MASKS_STORAGE_UTILS_H_ */
 
