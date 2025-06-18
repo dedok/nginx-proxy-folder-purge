@@ -23,7 +23,6 @@ Testing
 For testing introduced a set of [python scripts](./t). If you wish to use it
 inside own CI/CD please use as a reference [shell script](./t/run_local.sh).
 ##Steps to run tests:
-------------
 ```
 Step 1: compile nginx with the module.
 Step 2: run the script: ./t/run.sh or ./t/run_local.sh
