@@ -10,6 +10,9 @@
 # mask is not served from the cache, the object is fetched from the origin
 # again ("renewed on demand").
 #
+# It is the $folder_purge_bypass variable that does it, no nginx patch:
+# a location purges when it has "proxy_cache_bypass $folder_purge_bypass".
+#
 # The background purger is off here (t/conf/foreground.conf): nothing is
 # deleted from the disk and masks stay active until they are flushed.
 #
@@ -69,6 +72,33 @@ def test_renewed_object_is_cached_again(ctx):
     fresh = ctx.expect('/renewed/a.txt', 'BYPASS').body
 
     ctx.expect('/renewed/a.txt', 'HIT', fresh)
+
+
+def test_new_purge_renews_the_renewed_object(ctx):
+    """A copy that answered one purge is renewed again by a later purge.
+
+    A copy known to be newer than a purge is remembered, so the cache file
+    is not read again for the following requests: what is remembered must
+    not outlive that purge.
+    """
+    cached = ctx.expect('/twice/a.txt', 'MISS').body
+
+    for nth in ('first', 'second'):
+        ctx.purge_across_second('/twice/*')
+
+        fresh = ctx.expect('/twice/a.txt', 'BYPASS')
+
+        if fresh.body == cached:
+            fail('GET /twice/a.txt after the %s purge: expected a fresh '
+                 'body, got the previous one %r' % (nth, cached))
+
+        ctx.expect('/twice/a.txt', 'HIT', fresh.body)
+        cached = fresh.body
+
+    if ctx.origin_hits('/twice/a.txt') != 3:
+        fail('the origin was asked %d times for /twice/a.txt, expected 3: '
+             'once per purge and once for the first request' % (
+                 ctx.origin_hits('/twice/a.txt')))
 
 
 def test_object_cached_after_purge_is_kept(ctx):
@@ -181,6 +211,63 @@ def test_purge_is_off_where_on_request_is_off(ctx):
 
     ctx.expect('/off/a.txt', 'HIT', bodies['/off/a.txt'])
     ctx.expect('/off/b.txt', 'HIT', bodies['/off/b.txt'])
+
+
+def test_bypass_variable_is_set_for_the_renewing_request_only(ctx):
+    """$folder_purge_bypass is "1" for the request that renews an object only."""
+    first = ctx.expect('/var/a.txt', 'MISS')
+    ctx.purge_across_second('/var/*')
+
+    renewed = ctx.expect('/var/a.txt', 'BYPASS')
+    cached = ctx.expect('/var/a.txt', 'HIT', renewed.body)
+
+    for what, r, expected in (('the first request', first, None),
+                              ('the request that renews the purged object',
+                               renewed, '1'),
+                              ('the request served from the cache', cached,
+                               None)):
+        if r.headers.get('x-folder-purge-bypass') != expected:
+            fail('%s: expected X-Folder-Purge-Bypass %r, got %r' % (
+                what, expected, r.headers.get('x-folder-purge-bypass')))
+
+
+def test_purge_needs_proxy_cache_bypass(ctx):
+    """A purged object is served from the cache where the directive is missing."""
+    cached = ctx.expect('/unconfigured/a.txt', 'MISS').body
+    ctx.purge_across_second('/unconfigured/*')
+
+    r = ctx.expect('/unconfigured/a.txt', 'HIT', cached)
+
+    # The variable still asks for the bypass, the location just does not use it
+    if r.headers.get('x-folder-purge-bypass') != '1':
+        fail('GET /unconfigured/a.txt: expected X-Folder-Purge-Bypass 1, '
+             'got %r' % r.headers.get('x-folder-purge-bypass'))
+
+
+def test_purge_does_not_depend_on_the_cache_key_format(ctx):
+    """The purge matches the URL of the request, whatever the cache key is."""
+    cached = ctx.expect('/keyed/a.txt', 'MISS').body
+    ctx.purge_across_second('/keyed/*')
+
+    fresh = ctx.expect('/keyed/a.txt', 'BYPASS')
+
+    if fresh.body == cached:
+        fail('GET /keyed/a.txt after the purge: expected a fresh body, got '
+             'the cached one %r' % cached)
+
+    ctx.expect('/keyed/a.txt', 'HIT', fresh.body)
+
+
+def test_expired_object_is_left_to_nginx(ctx):
+    """An expired object is renewed by nginx itself, the purge does not step in."""
+    ctx.expect('/ttl/a.txt', 'MISS')
+    ctx.purge_across_second('/ttl/*')
+
+    # longer than proxy_cache_valid of the /ttl/ location
+    time.sleep(2.5 * harness.TIMEOUT_SCALE)
+
+    ctx.expect('/ttl/a.txt', 'EXPIRED')
+    ctx.expect('/ttl/a.txt', 'HIT')
 
 
 def test_masks_survive_nginx_restart(ctx):

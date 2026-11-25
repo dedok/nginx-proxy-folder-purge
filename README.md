@@ -3,13 +3,13 @@ About
 `nginx-proxy-pattern-purge` is `nginx` module which adds feature to invalidate (purge) cache via pattern like: `/*`, `/abc/xyz.*`. All incomming purge operations persist on disk, means nginx migth be perform start, stop and even `sign -9`, nginx won't lost purge operations all restorable from the disk at the momemnt start.
 
 Notice:
-- If you wish to see this module in action, then you need to patch apply one of [patches](patches/*).
+- The background purge needs a patched `nginx`, apply one of the [patches](patches/*). The foreground purge does not: it works with a stock `nginx` and is switched on by `proxy_cache_bypass $folder_purge_bypass;`.
 - This module not the best solution to purge a single object (file or cache entry).
 - This module does not respect some of nginx's internal structure, so cache zone meta information (like fs_size, number of keys, etc) updated only via nginx's `cache manager`.
 
 Build
 =====
-The module needs a patched `nginx`, see the [patches](patches/*). The tested
+The background purge needs a patched `nginx`, see the [patches](patches/*). The tested
 version is `nginx-1.19.4`, the `Makefile` does everything:
 
 ```bash
@@ -111,15 +111,28 @@ Enable or disable `foreground purge`. If it sets to `on`, then cache would be up
                 proxy_pass         http://127.0.0.1:8000;
                 proxy_cache        tmpcache;
                 proxy_cache_key    $uri$is_args$args;
+                proxy_cache_bypass $folder_purge_bypass;
 				proxy_folder_purge_on_request on;
             }
 			location /off {
                 proxy_folder_purge_on_request off;
                 ...
-			}
+            }
         }
     }
 ```
+
+$folder_purge_bypass
+--------------------
+The variable is what does the foreground purge, there is no nginx patch for
+it. Add it to `proxy_cache_bypass` (or to the `*_cache_bypass` of another
+upstream module) of the locations that have to purge.
+
+The variable is `1` for a request whose cached copy is covered by an active
+mask and is not newer than that purge: the copy is not taken from the cache,
+the one fetched from the origin is cached as usual. For any other request the
+variable is empty. Without the directive a purged object is served from the
+cache, i.e. `proxy_folder_purge_on_request` has nothing to switch on there.
 
 HTTP API
 ========

@@ -16,6 +16,10 @@
 #include <fnmatch.h>
 
 
+/** No active purge covers an URL */
+#define NGX_MASKS_NO_PURGE  ((time_t) -1)
+
+
 /** A structure for holding writer context (for X-Purge-Options: dump) */
 typedef struct {
     /** A reference to an http request */
@@ -41,6 +45,25 @@ typedef struct {
 } ngx_remove_file_ctx_t;
 
 
+/**
+ * A cached copy that has been looked at already: the copy of the key in the
+ * cache zone is newer than any purge up to "date". It spares the reading of
+ * the cache file for every request to an object under an active mask.
+ *
+ * The table belongs to a worker process. Collisions are not handled: a key
+ * that hashes to a taken slot overwrites it, which costs one more read.
+ */
+#define NGX_MASKS_FRESH_SIZE  4096
+
+typedef struct {
+    u_char                          key[NGX_HTTP_CACHE_KEY_LEN];
+    ngx_http_file_cache_t          *cache;
+    time_t                          date;      /* 0: the slot is free */
+} ngx_masks_fresh_t;
+
+static ngx_masks_fresh_t  ngx_masks_fresh[NGX_MASKS_FRESH_SIZE];
+
+
 typedef ngx_int_t (*ngx_on_add_mask) (ngx_masks_storage_t * /*ms*/,
     ngx_str_t * /*domain*/, ngx_str_t * /*mask*/,
     time_t /*purge_start_time*/, ngx_int_t /*is_restoring*/);
@@ -50,6 +73,18 @@ static inline void ngx_masks_storage_purger_queue_free(
 static ngx_int_t ngx_masks_storage_add_variables(ngx_conf_t *cf);
 static ngx_int_t ngx_masks_storage_cached_since_var(ngx_http_request_t *r,
         ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_masks_storage_bypass_var(ngx_http_request_t *r,
+        ngx_http_variable_value_t *v, uintptr_t data);
+static time_t ngx_masks_storage_purge_time(ngx_http_request_t *r,
+        ngx_masks_storage_loc_conf_t *conf);
+static ngx_int_t ngx_masks_storage_cache_header(ngx_http_request_t *r,
+        ngx_http_file_cache_header_t *header);
+static ngx_uint_t ngx_masks_fresh_slot(u_char *key,
+        ngx_http_file_cache_t *cache);
+static ngx_int_t ngx_masks_is_fresh(u_char *key,
+        ngx_http_file_cache_t *cache, time_t purge_time);
+static void ngx_masks_mark_fresh(u_char *key, ngx_http_file_cache_t *cache,
+        time_t date);
 
 static char *ngx_masks_storage_conf(ngx_conf_t *cf, ngx_command_t *cmd,
         void *conf);
@@ -150,6 +185,9 @@ static ngx_http_variable_t  ngx_masks_storage_vars[] = {
 
     { ngx_string("cached_since"), NULL,
       ngx_masks_storage_cached_since_var, 0, 0, 0 },
+
+    { ngx_string("folder_purge_bypass"), NULL,
+      ngx_masks_storage_bypass_var, 0, 0, 0 },
 
       ngx_http_null_variable
 };
@@ -1989,41 +2027,85 @@ ngx_http_cache_purge_folder_flush(ngx_http_request_t *r)
 }
 
 
-ngx_int_t
-ngx_http_foreground_purge(ngx_http_request_t *r,
-        ngx_http_cache_t *c, time_t now)
+static ngx_uint_t
+ngx_masks_fresh_slot(u_char *key, ngx_http_file_cache_t *cache)
 {
-    ngx_masks_storage_shctx_t        *sh;
-    ngx_slab_pool_t                  *shpool;
-    ngx_domain_rbtree_node_t         *node;
-    ngx_str_t                        *mask, domain, *url, temp_url;
-    ngx_mask_t                       *v;
-    ngx_masks_storage_t              *masks_storage;
-    ngx_masks_storage_loc_conf_t     *conf;
-    ngx_core_conf_t                  *ccf;
-    ngx_int_t                         cnt;
-    ngx_int_t                         find_mask;
-    ngx_masks_rbtree_node_t          *sub_node;
-    ngx_queue_t                      *q;
-    ngx_mask_queue_t                 *mask_queue;
+    ngx_uint_t  slot;
 
-    if (c == NULL
-        || c->node == NULL
-        || (c->node->updating && c->updating)
-        || c->valid_sec < now
-        /* This module may be recalled. Ignore sub-requests. */
-        || r != r->main)
-    {
-        return NGX_DECLINED;
+    /* The key is an MD5, so its bytes are spread evenly */
+    ngx_memcpy(&slot, key, sizeof(slot));
+
+    slot += (ngx_uint_t) (uintptr_t) cache;
+
+    return slot & (NGX_MASKS_FRESH_SIZE - 1);
+}
+
+
+/**
+ * The cached copy of the key is known to be newer than the purge
+ */
+static ngx_int_t
+ngx_masks_is_fresh(u_char *key, ngx_http_file_cache_t *cache,
+        time_t purge_time)
+{
+    ngx_masks_fresh_t  *slot;
+
+    slot = &ngx_masks_fresh[ngx_masks_fresh_slot(key, cache)];
+
+    return slot->date > purge_time
+           && slot->cache == cache
+           && ngx_memcmp(slot->key, key, NGX_HTTP_CACHE_KEY_LEN) == 0;
+}
+
+
+static void
+ngx_masks_mark_fresh(u_char *key, ngx_http_file_cache_t *cache, time_t date)
+{
+    ngx_masks_fresh_t  *slot;
+
+    slot = &ngx_masks_fresh[ngx_masks_fresh_slot(key, cache)];
+
+    ngx_memcpy(slot->key, key, NGX_HTTP_CACHE_KEY_LEN);
+    slot->cache = cache;
+    slot->date = date;
+}
+
+
+/**
+ * $folder_purge_bypass: "1" when the object has to be fetched from the
+ * origin again, i.e. an active mask covers the URL and the cached copy is
+ * not newer than that purge.
+ *
+ * It is made for proxy_cache_bypass (and the *_cache_bypass directives of
+ * the other upstream modules): the copy is not taken from the cache, the
+ * fetched one is cached as usual.
+ */
+static ngx_int_t
+ngx_masks_storage_bypass_var(ngx_http_request_t *r,
+        ngx_http_variable_value_t *v, uintptr_t data)
+{
+    time_t                           purge_time;
+    ngx_int_t                        rc;
+    ngx_core_conf_t                 *ccf;
+    ngx_http_cache_t                *c;
+    ngx_http_file_cache_header_t     header;
+    ngx_masks_storage_loc_conf_t    *conf;
+
+    *v = ngx_http_variable_null_value;
+
+    /* Not a request that can be cached. This module may be recalled.
+     * Ignore sub-requests. */
+    if (r->cache == NULL || r != r->main) {
+        return NGX_OK;
     }
 
     ccf = (ngx_core_conf_t *) ngx_get_conf(ngx_cycle->conf_ctx,
             ngx_core_module);
 
     if (!ccf->master) {
-        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                 "proxy_folder_purge: not support with \"master_process off;\"");
-        return NGX_DECLINED;
+        return NGX_OK;
     }
 
     /* Do no do anythong for non-purge requests */
@@ -2031,7 +2113,7 @@ ngx_http_foreground_purge(ngx_http_request_t *r,
             ngx_strncasecmp(r->method_name.data, (u_char *) "PURGE",
                              sizeof("PURGE") -1) == 0)
     {
-        return NGX_DECLINED;
+        return NGX_OK;
     }
 
     conf = ngx_http_get_module_loc_conf(r, ngx_masks_storage_module);
@@ -2040,19 +2122,80 @@ ngx_http_foreground_purge(ngx_http_request_t *r,
     if (conf->masks_storage == NULL) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
             "proxy_folder_purge: the module is off for \"%V\"", &r->uri);
-        return NGX_DECLINED;
+        return NGX_OK;
     }
 
     /** Module is on, but the feature is off */
     if (!conf->foreground_purge_enable) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
             "foreground purge: feature is off for \"%V\"", &r->uri);
-        return NGX_DECLINED;
+        return NGX_OK;
     }
 
+    purge_time = ngx_masks_storage_purge_time(r, conf);
+
+    if (purge_time == NGX_MASKS_NO_PURGE) {
+        return NGX_OK;
+    }
+
+    c = r->cache;
+
+    if (ngx_masks_is_fresh(c->key, c->file_cache, purge_time)) {
+        return NGX_OK;
+    }
+
+    rc = ngx_masks_storage_cache_header(r, &header);
+
+    if (rc != NGX_OK) {
+        /** The object is not cached or the copy can't be read: there is
+         * nothing to renew */
+        return NGX_OK;
+    }
+
+    if (header.date > purge_time) {
+        /** A copy cached after the purge answers it already */
+        ngx_masks_mark_fresh(c->key, c->file_cache, header.date);
+        return NGX_OK;
+    }
+
+    if (header.valid_sec < ngx_time()) {
+        /** An expired copy is renewed by nginx itself */
+        return NGX_OK;
+    }
+
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+            "proxy_folder_purge: \"%V\" purged", &r->uri);
+
+    v->data = (u_char *) "1";
+    v->len = 1;
+    v->valid = 1;
+
+    return NGX_OK;
+}
+
+
+/**
+ * The time of the latest active purge that covers the URL of the request,
+ * NGX_MASKS_NO_PURGE when there is no such purge.
+ */
+static time_t
+ngx_masks_storage_purge_time(ngx_http_request_t *r,
+        ngx_masks_storage_loc_conf_t *conf)
+{
+    ngx_masks_storage_shctx_t        *sh;
+    ngx_slab_pool_t                  *shpool;
+    ngx_domain_rbtree_node_t         *node;
+    ngx_str_t                        *mask, domain, *url, temp_url;
+    ngx_mask_t                       *v;
+    ngx_masks_storage_t              *masks_storage;
+    time_t                            purge_time;
+    ngx_int_t                         cnt;
+    ngx_masks_rbtree_node_t          *sub_node;
+    ngx_queue_t                      *q;
+    ngx_mask_queue_t                 *mask_queue;
+
     masks_storage = conf->masks_storage;
-    v = NULL;
-    find_mask = 0;
+    purge_time = NGX_MASKS_NO_PURGE;
     sh = masks_storage->sh;
     shpool = masks_storage->shpool;
     url = &r->uri;
@@ -2102,29 +2245,17 @@ ngx_http_foreground_purge(ngx_http_request_t *r,
 
             mask = &v->mask;
 
-            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+            ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                     "proxy_folder_purge: compare "
-                    "mask = \"%V\" ~ url = \"%V\" ~ temp_url = \"%V\" "
-                    "purge_start_time = %d ~ cache_create_time = %d",
-                    mask, url, &temp_url, v->purge_start_time, c->date);
+                    "mask = \"%V\" ~ temp_url = \"%V\" ~ url = \"%V\", "
+                    "purge_start_time = %T",
+                    mask, &temp_url, url, v->purge_start_time);
 
-            /** First check that purge_start_time > cache_create_time
-             * since it may skip a lot of string compare operations */
-            if (c->date <= v->purge_start_time) {
-
-                if (fnmatch_adapter(r->pool, r->connection->log,
-                        mask, &temp_url) == 0)
-                {
-                    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                        "proxy_folder_purge: \"%V\" purged", &r->uri);
-                    /** Renewing: */
-                    c->valid_sec = 0;
-                    c->valid_msec = 0;
-                    c->exists = 0;
-                    r->upstream->cache_status = NGX_HTTP_CACHE_BYPASS;
-                    find_mask = 1;
-                    goto out;
-                }
+            if (fnmatch_adapter(r->pool, r->connection->log,
+                    mask, &temp_url) == 0
+                && v->purge_start_time > purge_time)
+            {
+                purge_time = v->purge_start_time;
             }
         } /** for */
 
@@ -2135,9 +2266,71 @@ next_path:
 out:
     ngx_shmtx_unlock(&shpool->mutex);
 
-    /** NGX_DONE: the object is purged, the cache entry must not be used.
-     *  NGX_DECLINED: no mask covers the object. */
-    return find_mask ? NGX_DONE : NGX_DECLINED;
+    return purge_time;
+}
+
+
+/**
+ * The header of the cached copy of the requested object.
+ *
+ * @retval NGX_OK the header has been read
+ * @retval NGX_DECLINED there is no usable cached copy
+ *
+ * The file is found by the key of the request the same way as nginx does
+ * it: nginx names the file later, when it opens the cache.
+ */
+static ngx_int_t
+ngx_masks_storage_cache_header(ngx_http_request_t *r,
+        ngx_http_file_cache_header_t *header)
+{
+    u_char                   *p, *name;
+    ssize_t                   n;
+    ngx_fd_t                  fd;
+    ngx_path_t               *path;
+    ngx_http_cache_t         *c;
+
+    c = r->cache;
+
+    if (c->file.name.len) {
+        name = c->file.name.data;
+
+    } else {
+        path = c->file_cache->path;
+
+        name = ngx_pnalloc(r->pool, path->name.len + 1 + path->len
+                           + 2 * NGX_HTTP_CACHE_KEY_LEN + 1);
+        if (name == NULL) {
+            return NGX_ERROR;
+        }
+
+        ngx_memcpy(name, path->name.data, path->name.len);
+
+        p = ngx_hex_dump(name + path->name.len + 1 + path->len, c->key,
+                         NGX_HTTP_CACHE_KEY_LEN);
+        *p = '\0';
+
+        ngx_create_hashed_filename(path, name, p - name);
+    }
+
+    fd = ngx_open_file(name, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+
+    if (fd == NGX_INVALID_FILE) {
+        /** The object is not cached or the copy can't be read: there is
+         * nothing to renew */
+        return NGX_DECLINED;
+    }
+
+    n = ngx_read_fd(fd, header, sizeof(ngx_http_file_cache_header_t));
+
+    ngx_close_file(fd);
+
+    if (n != sizeof(ngx_http_file_cache_header_t)
+        || header->version != NGX_HTTP_CACHE_VERSION)
+    {
+        return NGX_DECLINED;
+    }
+
+    return NGX_OK;
 }
 
 

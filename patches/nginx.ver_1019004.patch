@@ -14,52 +14,6 @@ index 320adc2..aff4da2 100644
  } ngx_path_t;
  
  
-diff --git a/src/http/ngx_http_file_cache.c b/src/http/ngx_http_file_cache.c
-index c40093b..b060b0c 100644
---- a/src/http/ngx_http_file_cache.c
-+++ b/src/http/ngx_http_file_cache.c
-@@ -10,6 +10,10 @@
- #include <ngx_http.h>
- #include <ngx_md5.h>
- 
-+#if (NGX_MASKS_STORAGE)
-+#include <ngx_masks_storage.h>
-+#endif
-+
- 
- static ngx_int_t ngx_http_file_cache_lock(ngx_http_request_t *r,
-     ngx_http_cache_t *c);
-@@ -636,6 +640,30 @@ ngx_http_file_cache_read(ngx_http_request_t *r, ngx_http_cache_t *c)
- 
-     now = ngx_time();
- 
-+#if (NGX_MASKS_STORAGE)
-+
-+    if (r->method_name.len == sizeof("PURGE") - 1
-+        && ngx_strncmp(r->method_name.data, "PURGE", sizeof("PURGE") - 1)
-+           == 0)
-+    {
-+        /* do nothing, it's a purge request */
-+
-+    } else {
-+        rc = ngx_http_foreground_purge(r, r->cache, now);
-+
-+        if (rc == NGX_DONE) {
-+            return NGX_DECLINED;
-+        }
-+
-+        if (rc == NGX_ERROR) {
-+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-+                          "http file cache: foreground purge failed, rc = %i",
-+                          rc);
-+        }
-+    }
-+
-+#endif
-+
-     if (c->valid_sec < now) {
-         c->stale_updating = c->valid_sec + c->updating_sec >= now;
-         c->stale_error = c->valid_sec + c->error_sec >= now;
 diff --git a/src/os/unix/ngx_process_cycle.c b/src/os/unix/ngx_process_cycle.c
 index f87e009..03736dd 100644
 --- a/src/os/unix/ngx_process_cycle.c
