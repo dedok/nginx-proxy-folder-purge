@@ -189,6 +189,11 @@ typedef struct {
 /** PURGE external API {{{ */
 ngx_int_t ngx_http_foreground_purge(ngx_http_request_t *r,
         ngx_http_cache_t *c, time_t now);
+ngx_int_t ngx_http_folder_cache_purge(ngx_http_request_t *r);
+ngx_int_t ngx_http_folder_dump(ngx_http_request_t *r);
+ngx_int_t ngx_http_folder_flush(ngx_http_request_t *r);
+ngx_int_t ngx_http_folder_send_dump_handler(ngx_http_request_t *r);
+ngx_int_t ngx_http_folder_send_flush_handler(ngx_http_request_t *r);
 /** }}}*/
 
 #endif /* NGX_MASKS_STORAGE_H_ */

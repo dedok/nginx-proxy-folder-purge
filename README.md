@@ -9,33 +9,52 @@ Notice:
 
 Build
 =====
+The module needs a patched `nginx`, see the [patches](patches/*). The tested
+version is `nginx-1.19.4`, the `Makefile` does everything:
+
+```bash
+$ make        # downloads nginx and PCRE, applies the patch, builds nginx with the module
+$ make test   # runs the tests against ./nginx/objs/nginx
+```
+
+The same by hand:
 
 ```bash
 $ wget  https://nginx.org/download/nginx-1.19.4.tar.gz
 $ tar xf nginx-1.19.4.tar.gz
 $ mv nginx-1.19.4 nginx
 $ cd nginx
-$ patch -p1 <../nginx_folder_purge/patches/nginx.ver_1019004.patch
+$ patch -p1 <../patches/nginx.ver_1019004.patch
+$ ./configure --add-module=../proxy_folder_purge
+$ make
 ```
+
+`nginx-1.19.4` needs the first `PCRE` library, not `PCRE2`. When it is not
+installed, add `--with-pcre=<a directory with the PCRE sources>` to the
+`configure`, the library is built together with `nginx`.
 
 Testing
 =======
-For testing introduced a set of [python scripts](./t). If you wish to use it
-inside own CI/CD please use as a reference [shell script](./t/run_local.sh).
-##Steps to run tests:
+The tests are [python scripts](./t), they need `python3` only. Every
+`t/test_*.py` is a suite, for every test it starts its own origin server
+([t/origin.py](./t/origin.py)) and its own `nginx` with the module, see
+[t/harness.py](./t/harness.py).
+
+```bash
+$ ./t/run.sh                      # all suites
+$ ./t/run.sh foreground           # the suites with "foreground" in the file name
+$ TEST="crash host" ./t/run.sh    # only the tests with "crash" or "host" in the name
 ```
-Step 1: compile nginx with the module.
-Step 2: run the script: ./t/run.sh or ./t/run_local.sh
-Step 3: getting result OK or Failed.
-```
+
+A failed test keeps its sandbox in `t/.run/`, the `nginx` log is there.
+`NGINX_BIN` points the tests to another `nginx` binary.
 
 Configuration examples
 ======================
 A set of examples could be found in this repo, here is a short index:
-- [demo configuration with comments](demo/nginx.conf)
-- [foreground purge configuration example](t/conf/foreground_purge.conf)
-- [background purge configuration example](t/conf/background_purge.conf)
-- Some more more specific configuration examples could be found [at](t/conf)
+- [demo configuration with comments](examples/nginx.conf)
+- [foreground purge configuration example](t/conf/foreground.conf)
+- [background purge configuration example](t/conf/background.conf)
 
 Configuration directives
 ========================

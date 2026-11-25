@@ -1,3 +1,10 @@
 angie
 masks_storage*
-t/
+nginx/
+nginx-*.tar.gz
+pcre-*/
+pcre-*.tar.bz2
+test-root/
+t/.run/
+__pycache__/
+*.pyc

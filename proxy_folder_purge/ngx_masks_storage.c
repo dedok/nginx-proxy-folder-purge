@@ -2002,6 +2002,7 @@ ngx_http_foreground_purge(ngx_http_request_t *r,
     ngx_masks_storage_loc_conf_t     *conf;
     ngx_core_conf_t                  *ccf;
     ngx_int_t                         cnt;
+    ngx_int_t                         find_mask;
     ngx_masks_rbtree_node_t          *sub_node;
     ngx_queue_t                      *q;
     ngx_mask_queue_t                 *mask_queue;
@@ -2051,6 +2052,7 @@ ngx_http_foreground_purge(ngx_http_request_t *r,
 
     masks_storage = conf->masks_storage;
     v = NULL;
+    find_mask = 0;
     sh = masks_storage->sh;
     shpool = masks_storage->shpool;
     url = &r->uri;
@@ -2120,6 +2122,7 @@ ngx_http_foreground_purge(ngx_http_request_t *r,
                     c->valid_msec = 0;
                     c->exists = 0;
                     r->upstream->cache_status = NGX_HTTP_CACHE_BYPASS;
+                    find_mask = 1;
                     goto out;
                 }
             }
@@ -2132,7 +2135,9 @@ next_path:
 out:
     ngx_shmtx_unlock(&shpool->mutex);
 
-    return NGX_DONE;
+    /** NGX_DONE: the object is purged, the cache entry must not be used.
+     *  NGX_DECLINED: no mask covers the object. */
+    return find_mask ? NGX_DONE : NGX_DECLINED;
 }
 
 
