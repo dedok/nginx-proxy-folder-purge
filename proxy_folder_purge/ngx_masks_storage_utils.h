@@ -1,6 +1,6 @@
 
 /**
- * (C)
+ * (C) BSD, Vas Soshnikov
  */
 
 #ifndef NGX_MASKS_STORAGE_UTILS_H_
@@ -165,8 +165,7 @@ char** ngx_masks_load_sorted_filenames(DIR *d, ngx_pool_t *pool);
 char* get_regular_file_with_prefix(DIR *d, char ***names,
         const char *prefix, unsigned prefix_len, struct stat *info);
 
-ngx_int_t ngx_masks_storage_acquire_lock_file(ngx_cycle_t *cycle,
-        ngx_masks_storage_t *m, ngx_str_t *dirname);
+ngx_int_t ngx_masks_storage_try_lock_file(ngx_masks_storage_t *m);
 
 
 #endif /* NGX_MASKS_STORAGE_UTILS_H_ */

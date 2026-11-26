@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #
-# (C) BSDv2
+# (C) BSD, Vas Soshnikov
 #
 
 #

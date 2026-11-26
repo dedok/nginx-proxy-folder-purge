@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 #
-# (C) BSD v2
+# (C) BSD, Vas Soshnikov
 #
 
 #
@@ -10,8 +10,8 @@
 # mask is not served from the cache, the object is fetched from the origin
 # again ("renewed on demand").
 #
-# It is the $folder_purge_bypass variable that does it, no nginx patch:
-# a location purges when it has "proxy_cache_bypass $folder_purge_bypass".
+# It is the $folder_purge_bypass variable that does it: a location purges
+# when it has "proxy_cache_bypass $folder_purge_bypass".
 #
 # The background purger is off here (t/conf/foreground.conf): nothing is
 # deleted from the disk and masks stay active until they are flushed.

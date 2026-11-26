@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 #
-# (C)
+# (C) BSD, Vas Soshnikov
 #
 
 import os

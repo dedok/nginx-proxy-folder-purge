@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 #
-# (C) BSD v2
+# (C) BSD, Vas Soshnikov
 #
 
 #
@@ -19,7 +19,7 @@
 #
 # Environment:
 #   NFP_NGINX_BIN     nginx binary, default ./nginx/objs/nginx
-#   NFP_LOG_LEVEL     error_log level of the tested nginx, default notice
+#   NFP_LOG_LEVEL     error_log level of the tested nginx, default info
 #   NFP_TIMEOUT_SCALE multiply every timeout (slow machines, debuggers), default 1
 #   NFP_TRACEBACK     1 = print a traceback for every failed test
 #   NFP_KEEP          1 = keep sandboxes of passed tests too
@@ -51,12 +51,21 @@ DEFAULT_NGINX_BIN = os.path.join(REPO, 'nginx', 'objs', 'nginx')
 HOST = 'purge_folder'
 
 TIMEOUT_SCALE = float(os.environ.get('NFP_TIMEOUT_SCALE', '1'))
-LOG_LEVEL = os.environ.get('NFP_LOG_LEVEL', 'notice')
+# The module logs the end of a purge at the info level, and the tests wait
+# for that line
+LOG_LEVEL = os.environ.get('NFP_LOG_LEVEL', 'info')
 TRACEBACK = os.environ.get('NFP_TRACEBACK', '') == '1'
 KEEP = os.environ.get('NFP_KEEP', '') == '1'
 
-# The background purger polls its queue every 6 seconds when it is idle
+# The background purger looks for masks this often when it has nothing to do
+BG_PURGE_POLL = 1.0
+
+# The background purger needs longer than that for a purge when it is slow,
+# or when nginx's cache manager has to be respawned a few times
 BG_PURGE_TIMEOUT = 30
+
+# Where the background purger saves the position of the purge
+CHECKPOINT = '.bg-purge.checkpoint'
 
 # Cache entry dates and purge timestamps both have one-second resolution
 SECOND_MARGIN = 0.03
@@ -66,8 +75,16 @@ class TestFailure(AssertionError):
     pass
 
 
+class SkipTest(Exception):
+    """A test that does not apply to this nginx or to this system."""
+
+
 def fail(message):
     raise TestFailure(message)
+
+
+def skip(reason):
+    raise SkipTest(reason)
 
 
 class Response(object):
@@ -147,9 +164,18 @@ class Nginx(object):
         values = {'@NGINX_PORT@': port,
                   '@ORIGIN_PORT@': origin_port,
                   '@SANDBOX@': sandbox,
+                  '@MASKS_DIR@': sandbox,
                   '@LOG_LEVEL@': LOG_LEVEL,
-                  '@MAX_MASKS@': 1000}
-        values.update(('@%s@' % k, v) for k, v in (variables or {}).items())
+                  '@MAX_MASKS@': 1000,
+                  '@CACHE_INACTIVE@': '60m',
+                  '@OFC_VALID@': '300s',
+                  '@PURGER_FILES@': 100,
+                  '@PURGER_SLEEP@': '10ms',
+                  '@PURGER_THRESHOLD@': '20ms',
+                  '@PURGER_POLL@': '1s',
+                  '@LOCK_WAIT@': '120s'}
+        self.variables = {k: v for k, v in (variables or {}).items()}
+        values.update(('@%s@' % k, v) for k, v in self.variables.items())
 
         for name, value in values.items():
             text = text.replace(name, str(value))
@@ -183,6 +209,7 @@ class Nginx(object):
                 r = http_request(self.port, 'PURGE', '/', HOST,
                                  {'X-Purge-Options': 'dump'}, timeout=2)
                 if r.status == 200:
+                    self.wait_purger()
                     return
             except OSError:
                 pass
@@ -191,6 +218,36 @@ class Nginx(object):
 
         fail('nginx is not answering on 127.0.0.1:%d:\n%s' % (
             self.port, self.log_tail()))
+
+    def wait_purger(self):
+        """Wait until the cache manager process looks after the masks.
+
+        A worker answers before that. A purge that comes in between is
+        written to the disk, and the restoring reads it back into the
+        shared memory, over a flush for example. The purger looks after the
+        masks when it has restored them, or when it waits for the lock of
+        the masks storage that another nginx holds.
+        """
+        if LOG_LEVEL not in ('debug', 'info', 'notice'):
+            return
+
+        ready = ('the background purge has started in the cache manager process',
+                 'the background purge waits for the lock')
+        deadline = time.time() + 20 * TIMEOUT_SCALE
+
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise TestFailure(
+                    'nginx exited with code %d during the startup:\n%s' % (
+                        self.proc.returncode, self.log_tail()))
+
+            if any(line in self.log for line in ready):
+                return
+
+            time.sleep(0.02)
+
+        fail('the background purge of nginx has not started within 20 '
+             'seconds:\n%s' % self.log_tail())
 
     def log_tail(self, lines=15):
         lines_ = [l for l in self.log.split('\n') if l.strip()]
@@ -214,6 +271,43 @@ class Nginx(object):
     def uptime(self):
         return time.time() - self.started
 
+    def children(self, title):
+        """Pids of the processes of this nginx that have the title, for
+        example "worker process" or "cache manager process"."""
+        if self.proc is None:
+            return []
+
+        out = subprocess.check_output(
+            ['ps', '-axo', 'pid=,ppid=,command=']).decode('utf-8', 'replace')
+
+        pids = []
+        for line in out.split('\n'):
+            fields = line.split(None, 2)
+            if len(fields) == 3 and fields[1] == str(self.proc.pid) \
+                    and title in fields[2]:
+                pids.append(int(fields[0]))
+
+        return sorted(pids)
+
+    def wait_children(self, title, old, timeout=20):
+        """Wait until the processes with the title are not the old ones."""
+        deadline = time.time() + timeout * TIMEOUT_SCALE
+        while time.time() < deadline:
+            pids = self.children(title)
+            if pids and not set(pids) & set(old):
+                return pids
+            time.sleep(0.02)
+
+        fail('nginx got no new "%s" process within %d seconds:\n%s' % (
+            title, timeout, self.log_tail()))
+
+    def test_config(self):
+        """nginx -t with the configuration of this nginx, its exit code."""
+        with open(os.path.join(self.sandbox, 'logs', 'test.log'), 'ab') as err:
+            return subprocess.call(
+                [self.binary, '-t', '-p', self.sandbox, '-c', self.conf_path],
+                stdout=err, stderr=err)
+
 
 class Context(object):
     """Everything a test needs to talk to its nginx, origin and files."""
@@ -230,6 +324,10 @@ class Context(object):
 
         self.cache_dir = os.path.join(self.sandbox, 'cache')
         self.masks_dir = os.path.join(self.sandbox, 'masks_storage')
+        self.checkpoint = os.path.join(self.masks_dir, CHECKPOINT)
+
+        self.conf = conf
+        self.extra = []
 
         self.origin, self.origin_port = start_origin()
         self.nginx = Nginx(os.environ.get('NFP_NGINX_BIN', DEFAULT_NGINX_BIN),
@@ -264,6 +362,81 @@ class Context(object):
 
     def uptime(self):
         return self.nginx.uptime()
+
+    def uses_kqueue(self):
+        """Whether the event method of this nginx is kqueue, the only one
+        with which open_file_cache_events makes nginx notice a deleted file."""
+        return 'using the "kqueue" event method' in self.nginx.log
+
+    def skip_unless_kqueue(self, reason):
+        if not self.uses_kqueue():
+            skip(reason)
+
+    def cache_managers(self):
+        """Pids of nginx's cache manager processes of this nginx."""
+        return self.nginx.children('cache manager process')
+
+    def workers(self):
+        return self.nginx.children('worker process')
+
+    def reload(self):
+        """The master process reads the configuration again (SIGHUP): it
+        gets new workers and a new cache manager process."""
+        old_managers, old_workers = self.cache_managers(), self.workers()
+        self.close_conn()
+
+        os.kill(self.nginx.proc.pid, signal.SIGHUP)
+
+        managers = self.nginx.wait_children('cache manager process',
+                                            old_managers)
+        self.nginx.wait_children('worker process', old_workers)
+
+        deadline = time.time() + 20 * TIMEOUT_SCALE
+        while time.time() < deadline:
+            alive = set(self.cache_managers()) | set(self.workers())
+            if not alive & (set(old_managers) | set(old_workers)):
+                return managers
+            time.sleep(0.02)
+
+        fail('the old processes of nginx did not exit 20 seconds after the '
+             'reload:\n%s' % self.nginx.log_tail())
+
+    def crash_cache_manager(self):
+        """SIGKILL nginx's cache manager process only: the master process
+        respawns it, the way it does when the process crashes."""
+        old = self.cache_managers()
+        if len(old) != 1:
+            fail('expected one cache manager process, found %r' % old)
+
+        os.kill(old[0], signal.SIGKILL)
+
+        return self.nginx.wait_children('cache manager process', old)
+
+    def second_instance(self, variables=None):
+        """One more nginx with the same masks storage, but with its own
+        cache, logs and port: the way a new nginx and the old one are
+        running together while nginx is upgraded. It is stopped together
+        with the nginx of the test."""
+        sandbox = os.path.join(self.sandbox, 'second')
+
+        for d in ('', 'logs', 'cache', 'masks_storage'):
+            os.makedirs(os.path.join(sandbox, d))
+
+        values = dict(self.nginx.variables, MASKS_DIR=self.sandbox)
+        values.update(variables or {})
+
+        other = Nginx(self.nginx.binary, sandbox, self.conf,
+                      self.origin_port, free_port(), values)
+        other.start()
+        self.extra.append(other)
+
+        return other
+
+    def stop_extra(self):
+        for other in self.extra:
+            other.signal(signal.SIGQUIT)
+            other.wait()
+        self.extra = []
 
     # }}}
 
@@ -421,8 +594,12 @@ class Context(object):
 
 def clean_stale_runs():
     """Stop nginx instances left over by an interrupted run."""
-    for pid_path in glob.glob(os.path.join(RUN_DIR, '*', '*', 'logs',
-                                           'nginx.pid')):
+    pid_paths = glob.glob(os.path.join(RUN_DIR, '*', '*', 'logs', 'nginx.pid'))
+    # the second instance of a test has its own prefix under the sandbox
+    pid_paths += glob.glob(os.path.join(RUN_DIR, '*', '*', '*', 'logs',
+                                        'nginx.pid'))
+
+    for pid_path in pid_paths:
         sandbox = os.path.dirname(os.path.dirname(pid_path))
         try:
             with open(pid_path) as f:
@@ -506,7 +683,7 @@ def main(namespace, conf, patterns=None):
 
     clean_stale_runs()
 
-    passed = failed = errors = 0
+    passed = failed = errors = skipped = 0
     interrupted = False
     started = time.time()
 
@@ -527,6 +704,10 @@ def main(namespace, conf, patterns=None):
             message = str(e)
             tb = traceback.format_exc()
 
+        except SkipTest as e:
+            status = 'SKIP'
+            message = str(e)
+
         except KeyboardInterrupt:
             status = 'ERROR'
             message = 'interrupted'
@@ -539,6 +720,7 @@ def main(namespace, conf, patterns=None):
 
         finally:
             try:
+                ctx.stop_extra()
                 if ctx.nginx.proc is not None:
                     ctx.stop()
                 ctx.origin.shutdown()
@@ -553,30 +735,38 @@ def main(namespace, conf, patterns=None):
             passed += 1
         elif status == 'FAIL':
             failed += 1
+        elif status == 'SKIP':
+            skipped += 1
         else:
             errors += 1
 
-        if status == 'PASS' and not KEEP:
+        if status in ('PASS', 'SKIP') and not KEEP:
             shutil.rmtree(ctx.sandbox, ignore_errors=True)
 
         sys.stdout.write('[%s] %s\n' % (status, title(name)))
         sys.stdout.flush()
 
-        if message:
+        if status == 'SKIP':
+            for line in message.strip().split('\n'):
+                sys.stdout.write('       %s\n' % line)
+
+        elif message:
             # A failed test keeps its sandbox, the log is the starting point
             text = message + '\n' + tb if TRACEBACK else message
             for line in text.strip().split('\n'):
                 sys.stdout.write('       %s\n' % line)
             sys.stdout.write('       logs: %s\n' % ctx.nginx.log_path)
-            sys.stdout.flush()
+
+        sys.stdout.flush()
 
         if interrupted:
             break
 
     sys.stdout.write(
-        'RESULT: %d passed, %d failed, %d errors out of %d (%s) in %.1fs\n' % (
-            passed, failed, errors, passed + failed + errors, conf,
-            time.time() - started))
+        'RESULT: %d passed, %d failed, %d errors, %d skipped out of %d '
+        '(%s) in %.1fs\n' % (
+            passed, failed, errors, skipped,
+            passed + failed + errors + skipped, conf, time.time() - started))
     sys.stdout.flush()
 
-    sys.exit(0 if passed == len(tests) else 1)
+    sys.exit(0 if failed == 0 and errors == 0 else 1)

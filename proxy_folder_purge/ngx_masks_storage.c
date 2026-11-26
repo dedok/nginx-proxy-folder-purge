@@ -1,12 +1,14 @@
 
 /**
- * (C)
+ * (C) BSD, Vas Soshnikov
  */
 
 #include <ngx_masks_storage.h>
 #include <ngx_masks_resume_utils.h>
 #include <ngx_masks_fs_walker.h>
 #include <ngx_masks_storage_utils.h>
+
+#include <ngx_event.h>
 
 #include <stdio.h>
 #include <sys/types.h>
@@ -18,6 +20,36 @@
 
 /** No active purge covers an URL */
 #define NGX_MASKS_NO_PURGE  ((time_t) -1)
+
+
+/** The states of the background purger */
+typedef enum {
+    /** Taking the lock of the masks storage and restoring the masks */
+    NGX_MASKS_PURGER_START = 0,
+    /** Looking for masks, there is nothing to remove at the moment */
+    NGX_MASKS_PURGER_IDLE,
+    /** Removing the files of the masks, slice by slice */
+    NGX_MASKS_PURGER_WALK
+} ngx_masks_purger_state_t;
+
+/** Milliseconds before the next attempt to take the lock of the masks
+ *  storage: another generation of nginx is holding it */
+#define NGX_MASKS_PURGER_LOCK_RETRY      500
+
+/** Milliseconds before the next attempt to start the background purge:
+ *  the lock can't be taken or the masks can't be restored */
+#define NGX_MASKS_PURGER_START_RETRY   5000
+
+/** Seconds between two looks at the configuration while it switches the
+ *  background purge off */
+#define NGX_MASKS_PURGER_OFF_SLEEP    60000
+
+/**
+ * A purge is given up when nginx's cache manager process has been stopped
+ * this many times in a row in the middle of it: a cache file that crashes
+ * the cache manager would stop nginx's own cache maintenance that often.
+ */
+#define NGX_MASKS_PURGER_MAX_ATTEMPTS     3
 
 
 /** A structure for holding writer context (for X-Purge-Options: dump) */
@@ -63,6 +95,9 @@ typedef struct {
 
 static ngx_masks_fresh_t  ngx_masks_fresh[NGX_MASKS_FRESH_SIZE];
 
+/** open_file_cache is warned about once per worker process */
+static ngx_uint_t  ngx_masks_ofc_warned;
+
 
 typedef ngx_int_t (*ngx_on_add_mask) (ngx_masks_storage_t * /*ms*/,
     ngx_str_t * /*domain*/, ngx_str_t * /*mask*/,
@@ -85,6 +120,18 @@ static ngx_int_t ngx_masks_is_fresh(u_char *key,
         ngx_http_file_cache_t *cache, time_t purge_time);
 static void ngx_masks_mark_fresh(u_char *key, ngx_http_file_cache_t *cache,
         time_t date);
+
+static ngx_int_t ngx_masks_storage_init_module(ngx_cycle_t *cycle);
+static ngx_int_t ngx_masks_storage_init_process(ngx_cycle_t *cycle);
+static void ngx_masks_storage_warn_open_file_cache(ngx_http_request_t *r);
+
+/** The background purger, it runs in nginx's cache manager process */
+static ngx_msec_t ngx_masks_storage_manager(void *data);
+static ngx_msec_t ngx_masks_storage_purger_start(ngx_masks_storage_t *m);
+static ngx_msec_t ngx_masks_storage_purger_idle(ngx_masks_storage_t *m);
+static ngx_msec_t ngx_masks_storage_purger_slice(ngx_masks_storage_t *m);
+static ngx_int_t ngx_masks_storage_purger_counted(ngx_masks_storage_t *m);
+static void ngx_masks_storage_purger_finish(ngx_masks_storage_t *m);
 
 static char *ngx_masks_storage_conf(ngx_conf_t *cf, ngx_command_t *cmd,
         void *conf);
@@ -171,8 +218,8 @@ ngx_module_t  ngx_masks_storage_module = {
     ngx_masks_storage_commands,             /* module directives */
     NGX_HTTP_MODULE,                        /* module type */
     NULL,                                   /* init master */
-    NULL,                                   /* init module */
-    NULL,                                   /* init process */
+    ngx_masks_storage_init_module,          /* init module */
+    ngx_masks_storage_init_process,         /* init process */
     NULL,                                   /* init thread */
     NULL,                                   /* exit thread */
     NULL,                                   /* exit process */
@@ -241,6 +288,7 @@ ngx_masks_storage_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_uint_t                     i, background_purger_files;
     ngx_msec_t                     background_purger_sleep;
     ngx_msec_t                     background_purger_threshold;
+    ngx_msec_t                     background_purger_poll;
     ngx_msec_t                     background_purger_startup_lock_wait;
 
     if (cf->args->nelts < 4) {
@@ -255,6 +303,7 @@ ngx_masks_storage_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     background_purger_files = MASKS_STORAGE_PURGER_FILES_DEFAULT;
     background_purger_sleep = MASKS_STORAGE_PURGER_SLEEP_DEFAULT;
     background_purger_threshold = MASKS_STORAGE_PURGER_THRESHOLD_DEFAULT;
+    background_purger_poll = MASKS_STORAGE_PURGER_POLL_DEFAULT;
     background_purger_startup_lock_wait
                                 = MASKS_STORAGE_PURGER_STARTUP_LOCK_WAIT;
     background_purger_off = 0;
@@ -288,7 +337,16 @@ ngx_masks_storage_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             background_purger_threshold = ngx_parse_time(&tmp, 0);
             if (background_purger_threshold == (ngx_msec_t) NGX_ERROR) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                        "proxy_folder_purge: invalid purger_sleep value \"%V\"",
+                        "proxy_folder_purge: invalid purger_threshold value \"%V\"",
+                        &value[i]);
+                return NGX_CONF_ERROR;
+            }
+
+        } else if (IS_OPT("purger_poll=")) {
+            background_purger_poll = ngx_parse_time(&tmp, 0);
+            if (background_purger_poll == (ngx_msec_t) NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                        "proxy_folder_purge: invalid purger_poll value \"%V\"",
                         &value[i]);
                 return NGX_CONF_ERROR;
             }
@@ -340,14 +398,22 @@ ngx_masks_storage_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    /** background purge */
-    ms->path->manager = NULL;
+    /**
+     * The background purge is a manager of the masks storage path, so it is
+     * nginx's cache manager process that calls ngx_masks_storage_manager().
+     */
+    ms->path->manager = ngx_masks_storage_manager;
     ms->path->loader = NULL;
-    ms->path->purger = NULL;
+
+    /* at least one cache file is handled in a slice */
+    if (background_purger_files == 0) {
+        background_purger_files = 1;
+    }
 
     ms->background_purger_files = background_purger_files;
     ms->background_purger_sleep = background_purger_sleep;
     ms->background_purger_threshold = background_purger_threshold;
+    ms->background_purger_poll = background_purger_poll;
     ms->background_purger_off = background_purger_off;
     ms->background_purger_startup_lock_wait = background_purger_startup_lock_wait;
 
@@ -358,7 +424,6 @@ ngx_masks_storage_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         --tmp.len;
     }
 
-    ms->path->background_purger = -1;
     ms->path->data = (void *) ms;
     ms->path->conf_file = cf->conf_file->file.name.data;
     ms->path->line = cf->conf_file->line;
@@ -378,6 +443,9 @@ ngx_masks_storage_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
+    ngx_snprintf(ms->attempts_filename, sizeof(ms->attempts_filename),
+            "%V%s%Z", &ms->path->name, MASKS_PURGER_ATTEMPTS);
+
     if (ngx_create_full_path(ms->path->name.data, ngx_dir_access(0755))
             == NGX_FILE_ERROR)
     {
@@ -394,22 +462,46 @@ ngx_masks_storage_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
+    /*
+     * The dump of the masks is collected in a temporary file. The directory
+     * of the files is a path of nginx, as the masks storage is: nginx makes
+     * it the property of the user the workers run as.
+     */
     ms->tmp_path->manager = NULL;
     ms->tmp_path->loader = NULL;
-    ms->tmp_path->purger = NULL;
 
     ms->tmp_path->data = (void *) ms;
     ms->tmp_path->conf_file = cf->conf_file->file.name.data;
     ms->tmp_path->line = cf->conf_file->line;
-    ms->tmp_path->name.len = sizeof("logs") - 1;
-    ms->tmp_path->name.data = ngx_pcalloc(cf->pool, ms->tmp_path->name.len);
+    ms->tmp_path->name.len = tmp.len + sizeof(MASKS_STORAGE_TMP_DIR) - 1;
+
+    /* +1 for ngx_create_full_path, as it requires null-terminated string */
+    ms->tmp_path->name.data = ngx_pcalloc(cf->pool, ms->tmp_path->name.len + 1);
     if (ms->tmp_path->name.data == NULL) {
         return NGX_CONF_ERROR;
     }
 
-    ngx_snprintf(ms->tmp_path->name.data, ms->tmp_path->name.len, "logs");
+    p = ngx_snprintf(ms->tmp_path->name.data, ms->tmp_path->name.len + 1,
+            "%V%s%Z", &tmp, MASKS_STORAGE_TMP_DIR);
+    ms->tmp_path->name.len = (size_t) (p - ms->tmp_path->name.data - 1);
 
     if (ngx_conf_full_name(cf->cycle, &ms->tmp_path->name, 0) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_create_full_path(ms->tmp_path->name.data, ngx_dir_access(0755))
+            == NGX_FILE_ERROR)
+    {
+        if (ngx_errno != NGX_EEXIST) {
+            ngx_conf_log_error(NGX_LOG_CRIT, cf, ngx_errno,
+                                "proxy_folder_purge: "
+                                "ngx_create_full_path() \"%V\" failed",
+                                &ms->tmp_path->name);
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    if (ngx_add_path(cf, &ms->tmp_path) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
 
@@ -434,6 +526,55 @@ ngx_masks_storage_add_variables(ngx_conf_t *cf)
         var->get_handler = v->get_handler;
         var->data = v->data;
     }
+
+    return NGX_OK;
+}
+
+
+/**
+ * nginx has started, or has got a new configuration. What the previous
+ * generation has not managed to purge is continued then, and it is not a
+ * crash of the cache manager: see ngx_masks_storage_purger_counted().
+ *
+ * The function is called in the master process, by "nginx -t" as well.
+ */
+static ngx_int_t
+ngx_masks_storage_init_module(ngx_cycle_t *cycle)
+{
+    ngx_http_conf_ctx_t           *http_conf;
+    ngx_masks_storage_loc_conf_t  *loc_conf;
+
+    /* the configuration is only checked, nothing is started */
+    if (ngx_test_config) {
+        return NGX_OK;
+    }
+
+    http_conf = (ngx_http_conf_ctx_t *)
+                    cycle->conf_ctx[ngx_http_module.index];
+
+    if (http_conf == NULL || http_conf->loc_conf == NULL) {
+        return NGX_OK;
+    }
+
+    loc_conf = http_conf->loc_conf[ngx_masks_storage_module.ctx_index];
+
+    if (loc_conf->masks_storage == NULL
+        || loc_conf->masks_storage == NGX_CONF_UNSET_PTR)
+    {
+        return NGX_OK;
+    }
+
+    (void) ngx_delete_file(loc_conf->masks_storage->attempts_filename);
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_masks_storage_init_process(ngx_cycle_t *cycle)
+{
+    /* the warning about open_file_cache is logged once per worker process */
+    ngx_masks_ofc_warned = 0;
 
     return NGX_OK;
 }
@@ -2072,6 +2213,38 @@ ngx_masks_mark_fresh(u_char *key, ngx_http_file_cache_t *cache, time_t date)
 
 
 /**
+ * nginx keeps the descriptors of open files, cache files included, and it
+ * does not notice that the background purge has deleted a file as long as
+ * it uses a kept descriptor: the purged copy goes on being served until
+ * open_file_cache_valid runs out. open_file_cache_events makes nginx notice
+ * the deletion, but only with the kqueue event method.
+ */
+static void
+ngx_masks_storage_warn_open_file_cache(ngx_http_request_t *r)
+{
+    ngx_http_core_loc_conf_t  *clcf;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+    if (clcf->open_file_cache == NULL
+        || (clcf->open_file_cache_events
+            && ngx_event_flags & NGX_USE_VNODE_EVENT))
+    {
+        return;
+    }
+
+    ngx_masks_ofc_warned = 1;
+
+    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "proxy_folder_purge: open_file_cache is used, a cache file "
+            "removed by the background purge goes on being served from the "
+            "kept descriptor until open_file_cache_valid runs out. "
+            "open_file_cache_events on makes nginx notice the deletion at "
+            "once where the event method is kqueue");
+}
+
+
+/**
  * $folder_purge_bypass: "1" when the object has to be fetched from the
  * origin again, i.e. an active mask covers the URL and the cached copy is
  * not newer than that purge.
@@ -2123,6 +2296,10 @@ ngx_masks_storage_bypass_var(ngx_http_request_t *r,
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
             "proxy_folder_purge: the module is off for \"%V\"", &r->uri);
         return NGX_OK;
+    }
+
+    if (!ngx_masks_ofc_warned) {
+        ngx_masks_storage_warn_open_file_cache(r);
     }
 
     /** Module is on, but the feature is off */
@@ -2852,7 +3029,6 @@ ngx_masks_storage_purge_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
     ngx_uint_t                        buf_size;
     ngx_uint_t                        i;
     ngx_list_part_t                  *part;
-    ngx_msec_t                        elapsed;
 
     fd = -1;
     m = ctx->masks;
@@ -2885,18 +3061,19 @@ ngx_masks_storage_purge_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
     rc = pread(fd, buf, buf_size, 0);
     if (rc == -1 || rc < (off_t) header_size) {
 
+        /** The file is left alone, the next one is looked at */
         ngx_log_error(NGX_LOG_INFO, m->log, ngx_errno,
                 "proxy_folder_purge: ngx_masks_storage_purge_file: "
-                "can't read a file \"%s\", rc = %d, hs = %d",
-                entry->full_path, rc, (ngx_int_t) header_size);
-        rc = NGX_ABORT;
+                "can't read a file \"%s\", rc = %z, hs = %z",
+                entry->full_path, rc, (ssize_t) header_size);
+        rc = NGX_OK;
         goto exit;
     }
 
     h = (ngx_http_file_cache_header_t *) &buf[0];
 
     buf_start = &buf[0] + header_size;
-    buf_end = buf_start + rc;
+    buf_end = &buf[0] + rc;
 
     rc = NGX_OK;
 
@@ -2914,7 +3091,7 @@ ngx_masks_storage_purge_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
      *  can make module less predictable for users.
      *  Also check matching logic
      *  Skip schema if exists {{{ */
-    while (*buf_start != '/') {
+    while (buf_start < buf_end && *buf_start != '/') {
 
         /** Read a domain, if exist: */
         if (*buf_start == ':') {
@@ -2929,6 +3106,15 @@ ngx_masks_storage_purge_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
     }
     /** }}} */
 
+    if (buf_start == buf_end) {
+        /** The key does not say which url it is for */
+        ngx_log_error(NGX_LOG_INFO, m->log, 0,
+                "proxy_folder_purge: ngx_masks_storage_purge_file: "
+                "can't find an url in the key at \"%s\", skiping",
+                entry->full_path);
+        goto exit;
+    }
+
     url_start = buf_start;
     url_end = buf_end;
 
@@ -2942,15 +3128,6 @@ ngx_masks_storage_purge_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
             url_end = buf_start;
             break;
         }
-    }
-
-    if (url_start == NULL || url_end == NULL) {
-        ngx_log_error(NGX_LOG_ERR, m->log, 0,
-            "proxy_folder_purge: ngx_masks_storage_purge_file: "
-            "can't find an url in the key at \"%s\", skiping",
-            entry->full_path);
-        rc = NGX_OK;
-        goto exit;
     }
 
     url.data = url_start;
@@ -3026,53 +3203,83 @@ exit:
 
     (void) close(fd);
 
-    /** Master has been restarted or terminated.
-     */
+    /** nginx is stopping or reloading: the rest of the purge is left for
+     * the next generation */
     if (ngx_quit || ngx_terminate) {
         return NGX_ABORT;
     }
 
     ngx_time_update();
 
-    if (++m->processed_files >= m->background_purger_files) {
-        (void) usleep(1000);
-    } else {
+    ++m->processed_files;
+    ++m->slice_files;
 
-        elapsed = ngx_abs((ngx_msec_int_t) (ngx_current_msec - m->last));
-
-        if (m->background_purger_threshold > 0
-            && elapsed >= m->background_purger_threshold)
-        {
-            (void) usleep(1000);
-            m->last = ngx_current_msec;
-        }
-    }
-
-    return rc;
+    return NGX_OK;
 }
 
-
-ngx_int_t
-ngx_masks_storage_background_purge_init(ngx_cycle_t *cycle, void *ms,
-        ngx_str_t *dirname)
+/**
+ * The background purge has started in this process: take the lock of the
+ * masks storage and restore the masks from the disk.
+ */
+static ngx_msec_t
+ngx_masks_storage_purger_start(ngx_masks_storage_t *m)
 {
-    ngx_masks_storage_t *m = (ngx_masks_storage_t *) ms;
+    ngx_int_t  rc;
 
-    if (cycle == NULL
-        || ms == NULL
-        || dirname == NULL)
-    {
-        return NGX_ERROR;
+    m->log = ngx_cycle->log;
+
+    rc = ngx_masks_storage_try_lock_file(m);
+
+    if (rc == NGX_BUSY) {
+
+        if (m->lock_wait_start == 0) {
+            m->lock_wait_start = ngx_time();
+
+            ngx_log_error(NGX_LOG_NOTICE, m->log, 0,
+                    "proxy_folder_purge: the background purge waits for the "
+                    "lock of \"%V\", it is taken by another generation of "
+                    "nginx, pid %P", &m->path->name, m->lock_holder);
+
+        } else if (!m->purger_logged
+                   && ngx_time() - m->lock_wait_start
+                      >= (time_t) m->background_purger_startup_lock_wait)
+        {
+            m->purger_logged = 1;
+
+            ngx_log_error(NGX_LOG_ERR, m->log, 0,
+                    "proxy_folder_purge: the lock of \"%V\" is still taken by "
+                    "pid %P after %T sec, is another nginx running with the "
+                    "same masks storage?", &m->path->name, m->lock_holder,
+                    ngx_time() - m->lock_wait_start);
+        }
+
+        return NGX_MASKS_PURGER_LOCK_RETRY;
     }
 
-    m->log = cycle->log;
-    m->temp_pool = NULL;
-
-    if (ngx_masks_storage_acquire_lock_file(cycle, m, dirname) != NGX_OK) {
-        return NGX_ERROR;
+    if (rc == NGX_ERROR) {
+        return NGX_MASKS_PURGER_START_RETRY;
     }
 
-    return ngx_masks_storage_restore(m, dirname);
+    m->lock_wait_start = 0;
+    m->purger_logged = 0;
+
+    rc = ngx_masks_storage_restore(m, &m->path->name);
+
+    if (rc == NGX_ERROR || rc == NGX_ABORT) {
+        ngx_log_error(NGX_LOG_ERR, m->log, 0,
+                "proxy_folder_purge: the masks can't be restored from \"%V\"",
+                &m->path->name);
+        return NGX_MASKS_PURGER_START_RETRY;
+    }
+
+    ngx_log_error(NGX_LOG_NOTICE, m->log, 0,
+            "proxy_folder_purge: the background purge has started in the "
+            "cache manager process %P, masks storage path = \"%V\"",
+            ngx_pid, &m->path->name);
+
+    m->purger_state = NGX_MASKS_PURGER_IDLE;
+
+    return 0;
 }
 
 
@@ -3088,139 +3295,408 @@ save_checkpoint(void *data, const char *checkpoint)
     ngx_masks_save_checkpoint(ck);
 }
 
+
 /**
- * Main loop & logic of the background purge
+ * Remember that the purge of the masks list has been started once more,
+ * and tell whether it has been started too many times.
+ *
+ * The ".purger.attempts" file keeps the checksum of the masks and the
+ * number of the starts. The master process removes the file when nginx
+ * starts or gets a new configuration, so a purge that goes on after a
+ * reload is not counted. A crash of the cache manager in the middle of a
+ * purge is: nobody removes the file, and the respawned process reads it.
+ *
+ * @retval NGX_OK the purge goes on
+ * @retval NGX_ABORT the purge is given up: the cache manager has been
+ *         stopped NGX_MASKS_PURGER_MAX_ATTEMPTS times in the middle of it
+ * @retval NGX_ERROR the file can't be used, the purge goes on
  */
-ngx_msec_t
-ngx_masks_storage_background_purge(void *ms, ngx_str_t *dirname)
+static ngx_int_t
+ngx_masks_storage_purger_counted(ngx_masks_storage_t *m)
 {
-    ngx_masks_storage_t              *m = (ngx_masks_storage_t *) ms;
+    int                    fd;
+    ssize_t                n;
+    ngx_int_t              attempts;
+    ngx_uint_t             i;
+    u_char                *p;
+    ngx_masks_checkpoint_t *ck;
+    u_char                 buf[2 * 20 + 1 + sizeof("2147483647") + 1];
+    u_char                 line[sizeof(buf)];
 
-    ngx_uint_t                        i;
-    ngx_int_t                         rc;
-    ngx_array_t                      *roots;
-    ngx_str_t                        *path;
-    ngx_masks_checkpoint_t           *ck;
-    ngx_remove_file_ctx_t             rm_ctx;
-    const char                       *checkpoint;
-    ngx_str_t                         domain;
+    fd = ngx_open_file(m->attempts_filename, NGX_FILE_RDWR,
+                       NGX_FILE_CREATE_OR_OPEN, 0644);
 
-    if (m == NULL) {
-        return 60 * 1000;
+    if (fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_ERR, m->log, ngx_errno,
+                "proxy_folder_purge: can't open \"%s\"", m->attempts_filename);
+        return NGX_ERROR;
     }
 
-    if (m->background_purger_off == 1) {
-        ngx_log_error(NGX_LOG_INFO, m->log, 0,
-                "background purge process: is off by configuration, yielding "
-                "or is _NOT_ init correctly");
-        return 60 * 1000;
+    p = line;
+
+    for (i = 0; i < 20; i++) {
+        p = ngx_sprintf(p, "%02xd", m->masks_sha1[i]);
     }
 
-    rc = ngx_masks_storage_prepare_purger_queue(ms, dirname);
+    *p++ = ' ';
+
+    attempts = 1;
+
+    n = ngx_read_fd(fd, buf, sizeof(buf) - 1);
+
+    /* the same masks list has been started before */
+    if (n > p - line && ngx_memcmp(buf, line, p - line) == 0) {
+
+        /* the number is up to the end of the line */
+        for (i = 0; i < (ngx_uint_t) (n - (p - line)); i++) {
+            if (buf[p - line + i] < '0' || buf[p - line + i] > '9') {
+                break;
+            }
+        }
+
+        if (i > 0) {
+            attempts = ngx_atoi(buf + (p - line), i) + 1;
+        }
+
+        if (attempts <= 0) {
+            attempts = 1;
+        }
+    }
+
+    p = ngx_sprintf(p, "%d\n", attempts);
+
+    if (lseek(fd, 0, SEEK_SET) == -1
+        || ftruncate(fd, 0) == -1
+        || ngx_write_fd(fd, line, p - line) != p - line)
+    {
+        ngx_log_error(NGX_LOG_ERR, m->log, ngx_errno,
+                "proxy_folder_purge: can't write to \"%s\"",
+                m->attempts_filename);
+        ngx_close_file(fd);
+        return NGX_ERROR;
+    }
+
+    ngx_close_file(fd);
+
+    if (attempts <= NGX_MASKS_PURGER_MAX_ATTEMPTS) {
+        return NGX_OK;
+    }
+
+    ck = m->ck;
+
+    ngx_log_error(NGX_LOG_ALERT, m->log, 0,
+            "proxy_folder_purge: the purge of the queue \"%s\" is given up: "
+            "nginx's cache manager process has been stopped %d times in a row "
+            "in the middle of it, the last position is \"%V\". A cache file "
+            "around the position makes the cache manager stop and has to be "
+            "looked at. The files of this purge are not removed, "
+            "the purge has to be repeated",
+            m->purger_filename, attempts - 1, &ck->path_checkpoint);
+
+    return NGX_ABORT;
+}
+
+
+/**
+ * Look for masks. A purge starts either with the queue of masks that the
+ * previous generation has not managed to process, or with a new one.
+ */
+static ngx_msec_t
+ngx_masks_storage_purger_idle(ngx_masks_storage_t *m)
+{
+    ngx_int_t                    rc;
+    ngx_masks_checkpoint_t      *ck;
+    ngx_remove_file_ctx_t       *rm_ctx;
+
+    if (m->background_purger_off) {
+
+        if (!m->purger_logged) {
+            m->purger_logged = 1;
+
+            ngx_log_error(NGX_LOG_NOTICE, m->log, 0,
+                    "proxy_folder_purge: the background purge is switched off "
+                    "by the configuration, the masks are restored only");
+        }
+
+        return NGX_MASKS_PURGER_OFF_SLEEP;
+    }
+
+    rc = ngx_masks_storage_prepare_purger_queue(m, &m->path->name);
+
     if (rc != NGX_OK) {
-        ngx_log_error(NGX_LOG_NOTICE, m->log, 0,
-                "background purge process: prepare queue waiting with status "
-                "\'%s\'",
-                (rc != NGX_DECLINED ? "failed": "no incomming purges"));
-        return 6 * 1000;
+        return m->background_purger_poll;
     }
-
-    path = ngx_cycle->paths.elts;
 
     m->removed_files = 0;
     m->processed_files = 0;
-    m->last = 0;
     m->start_time = ngx_time();
+    m->roots = NULL;
+    m->root = 0;
+    m->walker = NULL;
+    m->ck = NULL;
+    m->rm_ctx = NULL;
 
-    rm_ctx.masks = m;
+    ck = ngx_masks_load_checkpoint(&m->path->name, m->temp_pool,
+                                   m->masks_sha1);
 
-    ck = ngx_masks_load_checkpoint(dirname, m->temp_pool, m->masks_sha1);
     if (ck == NULL) {
         ngx_log_error(NGX_LOG_ERR, m->log, 0,
-                      "proxy_folder_purge: unable to load checkpoint");
-        goto out;
+                "proxy_folder_purge: unable to load the checkpoint of the "
+                "purge queue \"%s\"", m->purger_filename);
+        goto failed;
     }
 
     /* set current masks checksum */
-    memcpy(ck->checksum, m->masks_sha1, sizeof(ck->checksum));
+    ngx_memcpy(ck->checksum, m->masks_sha1, sizeof(ck->checksum));
 
-    roots = ngx_masks_prepare_paths(ms, (ngx_array_t*) &ngx_cycle->paths, ck);
-    if (roots == NULL) {
-        goto out;
+    m->ck = ck;
+    m->roots = ngx_masks_prepare_paths(m, (ngx_array_t *) &ngx_cycle->paths,
+                                       ck);
+
+    rm_ctx = ngx_pcalloc(m->temp_pool, sizeof(ngx_remove_file_ctx_t));
+
+    if (m->roots == NULL || rm_ctx == NULL) {
+        ngx_log_error(NGX_LOG_ERR, m->log, 0,
+                "proxy_folder_purge: not enough memory for the purge of the "
+                "queue \"%s\"", m->purger_filename);
+        goto failed;
     }
 
-    path = roots->elts;
-    checkpoint = (ck != NULL) ? (char*) ck->path_checkpoint.data : NULL;
+    rm_ctx->masks = m;
+    m->rm_ctx = rm_ctx;
 
-    /*
-     * Searching & revoming cached date
-     */
-    for (i = 0; i < roots->nelts; i++) {
+    /* a crash of the cache manager in the middle of the purge must not
+     * turn into an endless stopping of it */
+    if (ngx_masks_storage_purger_counted(m) != NGX_OK) {
+        goto failed;
+    }
 
-        ngx_log_error(NGX_LOG_INFO, m->log, 0,
-                "proxy_folder_purge: working on path = \"%V\"",
-                &path[i]);
+    m->purger_state = NGX_MASKS_PURGER_WALK;
 
-        ck->cycle_path = path[i];
+    return 0;
 
-        /* Find masks queue per domain */
-        domain = ngx_masks_get_domain_from_path(&path[i]);
+failed:
 
-        rm_ctx.purge_urls = ngx_masks_get_per_domain_purge_queue(ms, &domain);
-        if (rm_ctx.purge_urls == NULL) {
-            continue;
-        }
+    ngx_masks_storage_purger_finish(m);
 
-        rc = ngx_masks_walk_fs((char*) path[i].data, checkpoint,
-                                ngx_masks_storage_purge_file, &rm_ctx,
-                                save_checkpoint, ck);
+    return m->background_purger_poll;
+}
 
-        /* checkpoint only affects the very first entry */
-        checkpoint = NULL;
 
-        if (rc == NGX_ERROR) {
-            ngx_log_error(NGX_LOG_ERR, m->log, ngx_errno,
-                    "proxy_folder_purge: can't read a path = \"%V\"",
-                    &path[i]);
-        } else if (rc == NGX_ABORT || rc == NGX_DECLINED) {
-            break;
-        }
-    } /* for */
+/**
+ * The purge is over, or is given up: the checkpoint and the queue files
+ * are removed, and the masks are dropped from the shared memory.
+ *
+ * Whatever fails on the way, a crash does not lose the rest: when the queue
+ * file is gone and the checkpoint is still there, the next start goes on
+ * from the checkpoint.
+ */
+static void
+ngx_masks_storage_purger_finish(ngx_masks_storage_t *m)
+{
+    ngx_masks_checkpoint_t  *ck;
 
-    /** All goes well, cleanup all resources, print some stats */
+    ck = m->ck;
+
     ngx_log_error(NGX_LOG_INFO, m->log, 0,
             "proxy_folder_purge: finished purge queue = \"%s\", "
-            "processed files = %d, removed files = %d, "
-            "exec. time (in sec) = %d",
-             m->purger_filename, m->processed_files, m->removed_files,
-             ngx_time() - m->start_time);
+            "processed files = %uz, removed files = %uz, "
+            "exec. time (in sec) = %T",
+            m->purger_filename, m->processed_files, m->removed_files,
+            ngx_time() - m->start_time);
 
-    /* Remove checkpoint on successful exit.
-     * We may run into situation when ngx_masks_storage_remove_purger_file()
-     * fails and next purger run will have to do everything from scratch.
-     * But we're protected against situation when purge masks files are removed,
-     * but state is clean - in this case new run will try to resume from previous
-     * iteration checkpoint.
-     * It could be improved by comparing timestamps of checkpoint/purger files,
-     * but that would be: a) complex; b) sensitive to clock skew */
-    if (unlink(ck->state_fname) != 0 && errno != ENOENT) {
-        ngx_log_error(NGX_LOG_ERR, m->log, 0,
+    if (ck != NULL && unlink(ck->state_fname) != 0 && errno != ENOENT) {
+        ngx_log_error(NGX_LOG_ERR, m->log, ngx_errno,
                       "proxy_folder_purge: can't remove checkpoint file \"%s\"",
                       ck->state_fname);
         goto out;
     }
 
-    if (ngx_masks_storage_remove_purger_file(m, dirname) != NGX_OK) {
+    if (ngx_masks_storage_remove_purger_file(m, &m->path->name) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, m->log, 0,
                 "proxy_folder_purge: can't remove purger file \"%V\"",
-                dirname);
+                &m->path->name);
         goto out;
     }
 
+    (void) ngx_delete_file(m->attempts_filename);
+
 out:
+
     ngx_masks_storage_purger_queue_free(m);
 
+    m->ck = NULL;
+    m->roots = NULL;
+    m->rm_ctx = NULL;
+}
+
+
+/**
+ * One slice of the purge: at most background_purger_files cache files, or
+ * background_purger_threshold milliseconds of them, are looked at. The rest
+ * is done by the following calls, the cache manager has its own work to do
+ * in between.
+ *
+ * @return the number of milliseconds to wait before the next call
+ */
+static ngx_msec_t
+ngx_masks_storage_purger_slice(ngx_masks_storage_t *m)
+{
+    ngx_uint_t                        i;
+    ngx_int_t                         rc;
+    ngx_str_t                        *path, domain;
+    ngx_list_t                       *purge_urls;
+    ngx_array_t                      *roots;
+    ngx_masks_checkpoint_t           *ck;
+    const char                       *checkpoint;
+
+    ck = m->ck;
+    roots = m->roots;
+    path = roots->elts;
+
+    m->slice_files = 0;
+    m->last = ngx_current_msec;
+
+    for (/* void */; m->root < roots->nelts; m->root++) {
+
+        if (m->walker == NULL) {
+
+            i = m->root;
+
+            ngx_log_error(NGX_LOG_INFO, m->log, 0,
+                    "proxy_folder_purge: working on path = \"%V\"", &path[i]);
+
+            ck->cycle_path = path[i];
+
+            /* Find masks queue per domain */
+            domain = ngx_masks_get_domain_from_path(&path[i]);
+
+            purge_urls = ngx_masks_get_per_domain_purge_queue(m, &domain);
+
+            if (purge_urls == NULL) {
+                continue;
+            }
+
+            ((ngx_remove_file_ctx_t *) m->rm_ctx)->purge_urls = purge_urls;
+
+            /* the checkpoint affects the very first cache directory only */
+            checkpoint = (i == 0) ? (const char *) ck->path_checkpoint.data
+                                  : NULL;
+
+            m->walker = ngx_masks_walker_start((char *) path[i].data,
+                            checkpoint, ngx_masks_storage_purge_file, m->rm_ctx,
+                            save_checkpoint, ck);
+
+            if (m->walker == NULL) {
+                ngx_log_error(NGX_LOG_ERR, m->log, ngx_errno,
+                        "proxy_folder_purge: can't read a path = \"%V\"",
+                        &path[i]);
+                continue;
+            }
+        }
+
+        for ( ;; ) {
+
+            /* the slice is over, the rest is done by the next call. Going
+             * into a directory takes time too, so the clock is asked on
+             * every step. */
+            ngx_time_update();
+
+            if (m->slice_files >= m->background_purger_files
+                || (m->background_purger_threshold > 0
+                    && ngx_current_msec - m->last
+                       >= m->background_purger_threshold))
+            {
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, m->log, 0,
+                        "proxy_folder_purge: slice of %ui files in %M ms",
+                        m->slice_files, ngx_current_msec - m->last);
+
+                return m->background_purger_sleep;
+            }
+
+            rc = ngx_masks_walker_step(m->walker);
+
+            if (rc == NGX_OK) {
+                continue;
+            }
+
+            if (rc == NGX_ABORT) {
+                /* nginx is stopping or reloading: the queue file and the
+                 * checkpoint are kept for the next generation */
+                return m->background_purger_sleep;
+            }
+
+            ngx_masks_walker_stop(m->walker);
+            m->walker = NULL;
+
+            if (rc != NGX_DONE) {
+                ngx_log_error(NGX_LOG_ERR, m->log, ngx_errno,
+                        "proxy_folder_purge: can't read a path = \"%V\"",
+                        &path[m->root]);
+            }
+
+            break;
+        }
+    }
+
+    ngx_masks_storage_purger_finish(m);
+
+    m->purger_state = NGX_MASKS_PURGER_IDLE;
+
     return m->background_purger_sleep;
+}
+
+
+/**
+ * The background purge.
+ *
+ * nginx's cache manager process calls it on a timer, the way it calls the
+ * managers of the cache zones: this is the manager of the masks storage
+ * path. The master process starts, respawns and stops the cache manager,
+ * so none of that needs code here.
+ *
+ * @param data the masks storage, ngx_path_t::data
+ * @return the number of milliseconds to wait before the next call
+ */
+static ngx_msec_t
+ngx_masks_storage_manager(void *data)
+{
+    ngx_masks_storage_t  *m = data;
+    ngx_msec_t            next, now;
+
+    ngx_time_update();
+
+    /* Another manager of the cache manager has asked for an earlier call
+     * than this one did */
+    now = ngx_current_msec;
+
+    if (m->purger_not_before != 0 && now < m->purger_not_before) {
+        return m->purger_not_before - now;
+    }
+
+    switch (m->purger_state) {
+
+    case NGX_MASKS_PURGER_START:
+        next = ngx_masks_storage_purger_start(m);
+        break;
+
+    case NGX_MASKS_PURGER_IDLE:
+        next = ngx_masks_storage_purger_idle(m);
+        break;
+
+    default: /* NGX_MASKS_PURGER_WALK */
+        next = ngx_masks_storage_purger_slice(m);
+    }
+
+    if (next == 0) {
+        m->purger_not_before = 0;
+        return 0;
+    }
+
+    ngx_time_update();
+    m->purger_not_before = ngx_current_msec + next;
+
+    return next;
 }
 
 

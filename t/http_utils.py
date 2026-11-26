@@ -1,4 +1,6 @@
 #
+# (C) BSD, Vas Soshnikov
+#
 # Common HTTP function for make tests easy
 #
 

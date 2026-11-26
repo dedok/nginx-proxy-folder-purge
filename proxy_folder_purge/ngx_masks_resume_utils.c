@@ -1,6 +1,6 @@
 
 /*
- * (C)
+ * (C) BSD, Vas Soshnikov
  */
 
 #include "ngx_masks_resume_utils.h"

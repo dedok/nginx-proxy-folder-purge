@@ -1,0 +1,171 @@
+#
+# (C) BSD, Vas Soshnikov
+#
+
+name: tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+# The jobs build the module and run its tests
+permissions:
+  contents: read
+
+# A new push to a branch cancels the run of the push before it
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# bash with pipefail, so that the exit code of make is not lost behind tee
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The timeouts of the tests are multiplied by this
+  NFP_TIMEOUT_SCALE: 2
+
+jobs:
+  test:
+    name: nginx ${{ matrix.nginx }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # A failed combination does not stop the other ones
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        nginx: [1.19.4, 1.30.8, 1.31.10]
+    env:
+      NGX_VERSION: ${{ matrix.nginx }}
+    steps:
+      - name: The repository
+        uses: actions/checkout@v7
+
+      - name: The libraries nginx needs
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # PCRE2 and zlib for nginx, bzip2 unpacks the PCRE that
+            # the Makefile builds for nginx 1.19.4
+            sudo apt-get update
+            sudo apt-get install -y libpcre2-dev zlib1g-dev bzip2
+          elif ! brew list pcre2 > /dev/null 2>&1; then
+            brew install pcre2
+          fi
+
+      - name: Build nginx with the module
+        run: make -j4 2>&1 | tee build.log
+
+      - name: Test
+        run: make test
+
+      - name: The logs of the build and of the tests
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-nginx-${{ matrix.nginx }}-${{ matrix.os }}
+          path: |
+            build.log
+            t/.run
+          if-no-files-found: ignore
+          retention-days: 14
+
+  optimized:
+    name: nginx ${{ matrix.nginx }} on linux, optimized build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        nginx: [1.30.8, 1.31.10]
+    env:
+      NGX_VERSION: ${{ matrix.nginx }}
+      # The Makefile takes these from the environment: the module with -O2,
+      # nginx without its debug logging
+      DEV_CFLAGS: -O2
+      NGX_DEBUG: ""
+    steps:
+      - name: The repository
+        uses: actions/checkout@v7
+
+      - name: The libraries nginx needs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcre2-dev zlib1g-dev
+
+      - name: Build nginx with the module
+        run: make -j4 2>&1 | tee build.log
+
+      - name: Test
+        run: make test
+
+      - name: The logs of the build and of the tests
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-nginx-${{ matrix.nginx }}-linux-optimized
+          path: |
+            build.log
+            t/.run
+          if-no-files-found: ignore
+          retention-days: 14
+
+  address-sanitizer:
+    name: nginx ${{ matrix.nginx }} on linux, AddressSanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        nginx: [1.30.8, 1.31.10]
+    env:
+      NGX_VERSION: ${{ matrix.nginx }}
+      # The Makefile takes these from the environment: the module with
+      # AddressSanitizer, nginx without its debug logging
+      DEV_CFLAGS: "-fsanitize=address -fno-omit-frame-pointer -g"
+      DEV_LDFLAGS: -fsanitize=address
+      NGX_DEBUG: ""
+      # nginx does not free its memory before it exits
+      ASAN_OPTIONS: detect_leaks=0
+      # The directories of the tests stay for the step after the tests
+      NFP_KEEP: 1
+    steps:
+      - name: The repository
+        uses: actions/checkout@v7
+
+      - name: The libraries nginx needs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcre2-dev zlib1g-dev
+
+      - name: Build nginx with the module
+        run: make -j4 2>&1 | tee build.log
+
+      - name: Test
+        run: make test
+
+      - name: The reports of the sanitizer
+        run: |
+          # A process of nginx exits as soon as the sanitizer finds an error
+          # in it, and a test may not notice that. Any report fails the job.
+          test -d t/.run
+          reports=$(grep -rl AddressSanitizer t/.run || true)
+          if [ -n "$reports" ]; then
+              echo "$reports"
+              exit 1
+          fi
+
+      - name: The logs of the build and of the tests
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-nginx-${{ matrix.nginx }}-linux-asan
+          path: |
+            build.log
+            t/.run
+          if-no-files-found: ignore
+          retention-days: 14

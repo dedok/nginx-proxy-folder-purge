@@ -3,18 +3,23 @@ About
 `nginx-proxy-pattern-purge` is `nginx` module which adds feature to invalidate (purge) cache via pattern like: `/*`, `/abc/xyz.*`. All incomming purge operations persist on disk, means nginx migth be perform start, stop and even `sign -9`, nginx won't lost purge operations all restorable from the disk at the momemnt start.
 
 Notice:
-- The background purge needs a patched `nginx`, apply one of the [patches](patches/*). The foreground purge does not: it works with a stock `nginx` and is switched on by `proxy_cache_bypass $folder_purge_bypass;`.
+- The foreground purge is switched on by `proxy_cache_bypass $folder_purge_bypass;`, see [$folder_purge_bypass](#folder_purge_bypass).
+- The background purge runs in nginx's `cache manager` process and deletes cache files. `open_file_cache` keeps nginx serving a deleted file for some time, see [open_file_cache](#open_file_cache).
 - This module not the best solution to purge a single object (file or cache entry).
 - This module does not respect some of nginx's internal structure, so cache zone meta information (like fs_size, number of keys, etc) updated only via nginx's `cache manager`.
 
 Build
 =====
-The background purge needs a patched `nginx`, see the [patches](patches/*). The tested
-version is `nginx-1.19.4`, the `Makefile` does everything:
+```bash
+$ make        # builds nginx-1.19.4 with the module
+$ make test   # runs the tests against ./nginx/objs/nginx
+```
+
+The version of nginx is chosen with `NGX_VERSION`:
 
 ```bash
-$ make        # downloads nginx and PCRE, applies the patch, builds nginx with the module
-$ make test   # runs the tests against ./nginx/objs/nginx
+$ make NGX_VERSION=1.30.8
+$ make test NGX_VERSION=1.30.8
 ```
 
 The same by hand:
@@ -24,14 +29,14 @@ $ wget  https://nginx.org/download/nginx-1.19.4.tar.gz
 $ tar xf nginx-1.19.4.tar.gz
 $ mv nginx-1.19.4 nginx
 $ cd nginx
-$ patch -p1 <../patches/nginx.ver_1019004.patch
 $ ./configure --add-module=../proxy_folder_purge
 $ make
 ```
 
-`nginx-1.19.4` needs the first `PCRE` library, not `PCRE2`. When it is not
-installed, add `--with-pcre=<a directory with the PCRE sources>` to the
-`configure`, the library is built together with `nginx`.
+`nginx-1.19.4` needs the `PCRE` library, not `PCRE2`. When it is not installed,
+add `--with-pcre=<a directory with the PCRE sources>` to the `configure`, the
+library is built together with `nginx`. The other versions use the `PCRE2` of
+the system.
 
 Testing
 =======
@@ -47,7 +52,13 @@ $ TEST="crash host" ./t/run.sh    # only the tests with "crash" or "host" in the
 ```
 
 A failed test keeps its sandbox in `t/.run/`, the `nginx` log is there.
-`NGINX_BIN` points the tests to another `nginx` binary.
+`NFP_KEEP=1` keeps the sandboxes of the passed tests too. `NGINX_BIN` points
+the tests to another `nginx` binary.
+
+[GitHub Actions](.github/workflows/tests.yml) builds the module with
+`1.19.4`, `1.30.8` and `1.31.10` on Linux and on macOS and runs the tests.
+On Linux the tests also run against a build with `-O2` and without the debug
+logging of `nginx`, and against one with AddressSanitizer in the module.
 
 Configuration examples
 ======================
@@ -60,7 +71,7 @@ Configuration directives
 ========================
 folder_purge
 -------------
-* **syntax**: `shared_memory_size=SIZE max_allowed_masks_per_domain=INT masks_storage_path=PATH [purger_sleep=MSEC purger_files=NUM purger_threshold=MSEC purger_server=STR purger_off]`
+* **syntax**: `shared_memory_size max_allowed_masks_per_domain masks_storage_path [purger_sleep=MSEC purger_files=NUM purger_threshold=MSEC purger_poll=MSEC startup_lock_delay=SEC purger_off]`
 * **default**: `none`
 * **context**: `http`
 
@@ -72,24 +83,73 @@ $> curl -H"Host: HOST" -H"X-Purge-Options: flush" -XPURGE endpoint
 where:
 - shared_memory_size - sets the size of the shared memory, it uses for storing patterns and its meta information. Example: 10m - 10 megabytes, 1g - 1 gygabyte.
 - max_allowed_masks_per_domain - sets max allowed _active_ performing patterns per domain, in other words it's a number of parallels running purge operation per domain (aka vhost). If limit is reached, the new operation performs an error (an HTTP code 429) until at leas one active operation is not done.
-- masks_storage_path - sets a path to masks storage files.
+- masks_storage_path - the directory the masks are stored in: its `masks_storage` subdirectory is used. Its `masks_storage_tmp` subdirectory is for the temporary files of a dump.
+
+Options of the background purge:
+- purger_sleep - a pause between two portions of the purge while there is something to purge. The default is `50ms`.
+- purger_files - how many cache files are looked at in one portion at most. The default is `100`.
+- purger_threshold - for how long one portion may go on. The default is `20ms`, `0` means no limit of time.
+- purger_poll - how often the purger looks for new masks when it has nothing to do. The default is `1s`.
+- startup_lock_delay - how long to wait before a message says that the lock of the masks storage is taken by another nginx. The default is `120` seconds, `off` means no lock at all.
+- purger_off - switches the background purge off: the masks are restored when nginx starts, and nothing is deleted.
 
 Example of the configuration:
 ```
 http {
-	folder_purge
-    	100m
-    	30
-    	.
-    	purger_sleep=1
-    	purger_files=1
-    	purger_threshold=1
-	;
+    folder_purge
+        100m
+        30
+        /var/cache/nginx
+        purger_sleep=50ms
+        purger_files=100
+        purger_threshold=20ms
+        purger_poll=1s
+    ;
 }
 ```
 
-### Background purge settings explanation
-The first background purge is an nginx's process managed by nginx's master process, and it does deleting of the cache and also it does cleanup shared memory that uses for on demand (i.e. foreground purge) cache deletion. So there are two type of storage: in memory storage, that compare requested vhost and patterns, and on disk storage that uses by background purge and restoring process, most of `purger_` parameters should be used to tune disk I/O load.
+### Background purge
+The background purge is the manager of the masks storage path, so it is
+nginx's `cache manager` process that does it, and the master process starts,
+respawns and stops the cache manager as it always does. There are two storages behind it: the masks are compared
+with the requests in the shared memory, and they are kept on the disk for the
+background purge and for restoring when nginx starts.
+
+A purge is done in portions: at most `purger_files` cache files, or
+`purger_threshold` of time, then the purger says when to call it again. The
+cache manager has its own work to do between the calls, so a long purge does
+not keep nginx's cache maintenance waiting. One thing is not cut into
+portions: reading the list of files of a directory. A cache directory with
+hundreds of thousands of files in it, that is a cache without `levels`, stops
+the cache manager for the time of that; `levels=1:2` keeps it short.
+
+The purger saves its position once in a second. When nginx stops, is reloaded
+or crashes in the middle of a purge, the next cache manager goes on from
+there: the queue file of the masks and the position are kept until the purge
+is over.
+
+The lock file of the masks storage, `.lock`, makes it one purger per masks
+storage, for example while a new nginx and the old one are running together.
+
+A purge that makes the cache manager stop is given up when the cache manager
+has been stopped 3 times in a row in the middle of it: otherwise a cache file
+that crashes the cache manager would also stop nginx's own cache maintenance
+that often. An `alert` in the log says which purge it is and where the cache
+manager stopped, the masks of the purge are dropped, and the purges that come
+after go on. A start of nginx, or a new configuration, resets the count: a
+purge that goes on after a reload is not a crash.
+
+### open_file_cache
+The background purge deletes cache files. With `open_file_cache` switched on,
+nginx keeps the descriptors of open files, cache files included, and goes on
+serving a deleted file from the kept descriptor until `open_file_cache_valid`
+runs out, 60 seconds by default.
+
+`open_file_cache_events on` makes nginx notice the deletion at once with the
+`kqueue` event method only, that is on FreeBSD and on macOS. On Linux do not
+switch `open_file_cache` on for the locations that serve from the cache. The
+module logs a warning when it sees a location with `open_file_cache` where
+the deleted file would go on being served.
 
 Configuration directives
 ========================
@@ -124,9 +184,9 @@ Enable or disable `foreground purge`. If it sets to `on`, then cache would be up
 
 $folder_purge_bypass
 --------------------
-The variable is what does the foreground purge, there is no nginx patch for
-it. Add it to `proxy_cache_bypass` (or to the `*_cache_bypass` of another
-upstream module) of the locations that have to purge.
+The variable does the foreground purge. Add it to `proxy_cache_bypass` (or to
+the `*_cache_bypass` of another upstream module) of the locations that have to
+purge.
 
 The variable is `1` for a request whose cached copy is covered by an active
 mask and is not newer than that purge: the copy is not taken from the cache,

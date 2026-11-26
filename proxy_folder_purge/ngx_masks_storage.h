@@ -1,6 +1,6 @@
 
 /**
- * (C) BSDv2
+ * (C) BSD, Vas Soshnikov
  */
 
 #ifndef NGX_MASKS_STORAGE_H_
@@ -19,8 +19,12 @@
 
 
 #define MASKS_STORAGE_DIR     "/masks_storage/"
+/** The directory the temporary files of a dump are written to */
+#define MASKS_STORAGE_TMP_DIR "/masks_storage_tmp/"
 #define MASKS_IN              "masks.in."
 #define MASKS_PURGER          "masks.purger"
+/** The file that counts the starts of a purge, see ngx_masks_storage.c */
+#define MASKS_PURGER_ATTEMPTS ".purger.attempts"
 #define ZONE_NAME             "__ngx_masks_storage"
 #define LOG_HINT              " in proxy_folder_purge zone " ZONE_NAME
 #define MASKS_STORAGE_MAGIC   "BEEF"
@@ -33,6 +37,7 @@
 #define MASKS_STORAGE_PURGER_FILES_DEFAULT       100
 #define MASKS_STORAGE_PURGER_SLEEP_DEFAULT       50
 #define MASKS_STORAGE_PURGER_THRESHOLD_DEFAULT   20
+#define MASKS_STORAGE_PURGER_POLL_DEFAULT        1000
 #define MASKS_STORAGE_PURGE_REF_COUNT_MAX        1024
 #define MASKS_STORAGE_PURGE_REF_COUNT_MAX_STR    "1024"
 #define MASKS_STORAGE_PURGER_STARTUP_LOCK_WAIT   120
@@ -151,6 +156,7 @@ typedef struct {
   ngx_uint_t                     background_purger_files;
   ngx_msec_t                     background_purger_sleep;
   ngx_msec_t                     background_purger_threshold;
+  ngx_msec_t                     background_purger_poll;
   ngx_uint_t                     background_purger_startup_lock_wait; /* in seconds */
   ngx_int_t                      background_purger_off;
 
@@ -162,6 +168,26 @@ typedef struct {
 
   ngx_masks_purge_queue_t        *per_domain_purge_masks;
   u_char                         purger_filename[PATH_MAX + 1];
+  u_char                         attempts_filename[PATH_MAX + 1];
+
+  /**
+   * The background purger. Only nginx's cache manager process uses these
+   * fields, and every process has its own copy of them.
+   */
+  ngx_uint_t                     purger_state:8;
+  ngx_uint_t                     purger_logged:1;   /* the state is logged */
+  time_t                         lock_wait_start;
+  ngx_pid_t                      lock_holder;
+  /** The cache manager calls the purger not earlier than this moment */
+  ngx_msec_t                     purger_not_before;
+  /** The purge in progress: the cache directories to walk, the one being
+   *  walked, the walker, the checkpoint and the context of the file callback */
+  ngx_array_t                   *roots;
+  ngx_uint_t                     root;
+  void                          *walker;    /* ngx_masks_walker_t */
+  void                          *ck;        /* ngx_masks_checkpoint_t */
+  void                          *rm_ctx;    /* ngx_remove_file_ctx_t */
+  ngx_uint_t                     slice_files;
 
   /** */
   ngx_pool_t                    *temp_pool;

@@ -1,6 +1,6 @@
 
 /*
- * (C)
+ * (C) BSD, Vas Soshnikov
  */
 
 #ifndef NGX_MASKS_RESUME_UTILS_H

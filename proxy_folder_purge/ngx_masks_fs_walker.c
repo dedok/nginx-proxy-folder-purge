@@ -1,6 +1,6 @@
 
 /*
- * (C)
+ * (C) BSD, Vas Soshnikov
  */
 
 #include <ngx_masks_fs_walker.h>
@@ -471,6 +471,286 @@ skip_to_checkpoint(const char *checkpoint, dir_walker_frame_t *top)
     return checkpoint;
 }
 
+/** The state of a walk. It lives from ngx_masks_walker_start() up to
+ * ngx_masks_walker_stop(), and may be kept between small portions of work. */
+struct ngx_masks_walker_s {
+    /** Callbacks, the arguments of ngx_masks_walker_start() */
+    ngx_masks_fs_walker_file_pt        on_file;
+    void                              *on_file_ctx;
+    ngx_masks_fs_walker_state_pt       on_checkpoint;
+    void                              *on_checkpoint_ctx;
+
+    /** What is left of the checkpoint to skip, NULL when nothing is */
+    const char                        *checkpoint;
+    time_t                             last_checkpoint;
+
+    /** Depth of the current directory and the current directory itself */
+    unsigned                           depth;
+    dir_walker_frame_t                *top;
+
+    /** Length of the root path in path_buf, the trailing '/' included */
+    unsigned                           path_start;
+
+    /** Useful information about current entry */
+    ngx_masks_fs_walker_ctx            entry;
+
+    /* to keep track of the current hierarchy to avoid loops */
+    inode_info_t                       dinfo[MAX_DEPTH];
+    dir_walker_frame_t                 stack[MAX_DEPTH];
+    mem_chunk_list_t                   free_list;
+    char                               path_buf[PATH_MAX];
+};
+
+
+ngx_masks_walker_t *
+ngx_masks_walker_start(const char *dirp, const char *checkpoint,
+                       ngx_masks_fs_walker_file_pt on_file,
+                       void *on_file_ctx,
+                       ngx_masks_fs_walker_state_pt on_checkpoint,
+                       void *on_checkpoint_ctx)
+{
+    unsigned              i;
+    ngx_masks_walker_t   *w;
+
+    if (dirp == NULL || on_file == NULL || on_checkpoint == NULL) {
+        return NULL;
+    }
+
+    w = ngx_alloc(sizeof(ngx_masks_walker_t), ngx_cycle->log);
+    if (w == NULL) {
+        return NULL;
+    }
+
+    ngx_memzero(w, sizeof(ngx_masks_walker_t));
+
+    w->on_file = on_file;
+    w->on_file_ctx = on_file_ctx;
+    w->on_checkpoint = on_checkpoint;
+    w->on_checkpoint_ctx = on_checkpoint_ctx;
+
+    STAILQ_INIT(&w->free_list);
+
+    for (i = 0; i < MAX_DEPTH; i++) {
+        dir_contents_init(&w->stack[i].contents, &w->free_list);
+        w->stack[i].dh = NULL;
+    }
+
+    w->path_start = ngx_strlen(dirp);
+
+    if (w->path_start == 0
+        || w->path_start + 1 >= sizeof(w->path_buf))
+    {
+        ngx_free(w);
+        return NULL;
+    }
+
+    /* Initialize top frame */
+    w->top = &w->stack[0];
+    w->top->entry = 0;
+
+    w->top->dh = opendir(dirp);
+    if (w->top->dh == NULL) {
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, ngx_errno,
+                "ngx_masks_walk_fs: opendir(%s) failed", dirp);
+        goto failed;
+    }
+
+    w->top->dfd = dirfd(w->top->dh);
+
+    (void) dir_contents_load(&w->top->contents, w->top->dh);
+
+    /* Save root path with trailing slashes stripped. */
+    while (w->path_start > 0 && dirp[w->path_start - 1] == '/') {
+        w->path_start--;
+    }
+
+    ngx_memcpy(w->path_buf, dirp, w->path_start);
+    w->path_buf[w->path_start++] = '/';
+    w->path_buf[w->path_start] = 0;
+    w->top->path_prefix_len = w->path_start;
+
+    /* Ensure that top frame is a directory */
+    if (fstat(w->top->dfd, &w->entry.info) != 0) {
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, ngx_errno,
+                "ngx_masks_walk_fs: fstat() failed at %s", w->path_buf);
+        goto failed;
+    }
+
+    w->dinfo[0].dev = w->entry.info.st_dev;
+    w->dinfo[0].ino = w->entry.info.st_ino;
+
+    /* Setup initial entry contents */
+    w->entry.full_path = w->path_buf;
+    w->entry.h_name = w->entry.e_name = w->path_buf + w->path_start;
+    w->entry.cfd = w->top->dfd;
+
+    w->checkpoint = checkpoint;
+    w->last_checkpoint = time(NULL);
+
+    return w;
+
+failed:
+
+    walker_cleanup(w->stack, MAX_DEPTH, &w->free_list);
+    ngx_free(w);
+
+    return NULL;
+}
+
+
+ngx_int_t
+ngx_masks_walker_step(ngx_masks_walker_t *w)
+{
+    unsigned               i;
+    time_t                 ts;
+    dir_entry_t           *e;
+    dir_walker_frame_t    *top;
+
+    top = w->top;
+
+    if (w->checkpoint && *w->checkpoint) {
+        w->checkpoint = skip_to_checkpoint(w->checkpoint, top);
+    }
+
+    if (top->entry >= top->contents.size) {
+        do {
+            closedir(top->dh);
+            top->dh = NULL;
+            dir_contents_reset(&top->contents);
+            if (top == w->stack) {
+                goto done;
+            }
+
+            w->depth--;
+            top--;
+        } while (top->entry >= top->contents.size);
+
+        w->top = top;
+
+        ts = time(NULL);
+
+        if (ts != w->last_checkpoint) {
+            /* Construct name of the last fully processed dir */
+            w->path_buf[top[1].path_prefix_len] = 0;
+            w->on_checkpoint(w->on_checkpoint_ctx,
+                             w->path_buf + w->stack[0].path_prefix_len);
+            w->last_checkpoint = ts;
+        }
+
+        w->path_buf[top->path_prefix_len] = 0;
+        w->entry.cfd = top->dfd;
+        w->entry.e_name = w->path_buf + top->path_prefix_len;
+        w->checkpoint = NULL;
+    }
+
+    e = top->contents.elts[top->entry];
+    top->entry++;
+
+    if (fstatat(top->dfd, e->name, &w->entry.info, 0) != 0) {
+        return NGX_OK;
+    }
+
+    if (S_ISDIR(w->entry.info.st_mode)) {
+
+        if (w->depth + 1 >= MAX_DEPTH) {
+            return NGX_OK;
+        }
+
+        top[1].dfd = openat(top->dfd, e->name, O_RDONLY | O_DIRECTORY);
+        if (top[1].dfd == -1) {
+            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                    "ngx_masks_walk_fs: openat(%s/%s) failed: %s",
+                    w->path_buf, e->name, strerror(errno));
+            return NGX_OK;
+        }
+
+        /* Protect against recursion */
+        for (i = 0; i <= w->depth; i++) {
+
+            if (w->entry.info.st_ino == w->dinfo[i].ino
+                && w->entry.info.st_dev == w->dinfo[i].dev)
+            {
+                break;
+            }
+        }
+
+        if (i <= w->depth) {
+            /* We get here if recursion had been detected */
+            close(top[1].dfd);
+            return NGX_OK;
+        }
+
+        /* Load new directory contents */
+        top[1].dh = fdopendir(top[1].dfd);
+        if (top[1].dh == NULL) {
+
+            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                    "ngx_masks_walk_fs: fdopendir(%s/%s) failed: %s",
+                    w->path_buf, e->name, strerror(errno));
+
+            close(top[1].dfd);
+            top[1].dh = NULL;
+            return NGX_OK;
+        }
+
+        if (dir_contents_load(&top[1].contents, top[1].dh) != 0) {
+            dir_contents_reset(&top[1].contents);
+            closedir(top[1].dh);
+            top[1].dh = NULL;
+            return NGX_OK;
+        }
+
+        ngx_memcpy(w->path_buf + top->path_prefix_len, e->name, e->namelen);
+        w->path_buf[top->path_prefix_len + e->namelen] = '/';
+        w->path_buf[top->path_prefix_len + e->namelen + 1] = 0;
+        top[1].path_prefix_len = top->path_prefix_len + 1 + e->namelen;
+        top[1].entry = 0;
+
+        w->entry.cfd = top[1].dfd;
+        w->entry.e_name = w->path_buf + top[1].path_prefix_len;
+
+        top++;
+        w->top = top;
+        w->depth++;
+        w->dinfo[w->depth].dev = w->entry.info.st_dev;
+        w->dinfo[w->depth].ino = w->entry.info.st_ino;
+
+    } else if (S_ISREG(w->entry.info.st_mode)) {
+
+        ngx_memcpy(w->path_buf + top->path_prefix_len, e->name, e->namelen + 1);
+
+        if (w->on_file(w->on_file_ctx, &w->entry) == NGX_ABORT) {
+            return NGX_ABORT;
+        }
+
+        ts = time(NULL);
+        if (ts != w->last_checkpoint) {
+            w->on_checkpoint(w->on_checkpoint_ctx,
+                             w->path_buf + w->stack[0].path_prefix_len);
+            w->last_checkpoint = ts;
+        }
+    }
+
+    return NGX_OK;
+
+done:
+
+    return NGX_DONE;
+}
+
+
+void
+ngx_masks_walker_stop(ngx_masks_walker_t *w)
+{
+    if (w == NULL) {
+        return;
+    }
+
+    walker_cleanup(w->stack, MAX_DEPTH, &w->free_list);
+
+    ngx_free(w);
+}
+
 
 ngx_int_t
 ngx_masks_walk_fs(const char *dirp, const char *checkpoint,
@@ -479,213 +759,20 @@ ngx_masks_walk_fs(const char *dirp, const char *checkpoint,
                   ngx_masks_fs_walker_state_pt on_checkpoint,
                   void *on_checkpoint_ctx)
 {
-    int                     saved_errno;
-    char                    path_buf[PATH_MAX];
-    unsigned                i, p_start;
-    unsigned                depth = 0;
-    time_t                  last_checkpoint, ts;
+    ngx_int_t              rc;
+    ngx_masks_walker_t    *w;
 
-    /* to keep track of the current hierarchy to avoid loops */
-    inode_info_t            dinfo[MAX_DEPTH];
-    dir_walker_frame_t      stack[MAX_DEPTH], *top = stack;
-    mem_chunk_list_t        free_list;
-    dir_entry_t            *e;
-
-    /* Useful information about current entry */
-    ngx_masks_fs_walker_ctx entry;
-
-    STAILQ_INIT(&free_list);
-    for (i = 0; i < MAX_DEPTH; i++) {
-        dir_contents_init(&stack[i].contents, &free_list);
-        stack[i].dh = NULL;
-    }
-
-    p_start = strlen(dirp);
-    if (p_start == 0
-        || p_start + 1 >= sizeof(path_buf))
-    {
+    w = ngx_masks_walker_start(dirp, checkpoint, on_file, on_file_ctx,
+                               on_checkpoint, on_checkpoint_ctx);
+    if (w == NULL) {
         return NGX_ERROR;
     }
 
-    top->dh = opendir(dirp);
-    if (top->dh == NULL) {
-        return NGX_ERROR;
+    while ((rc = ngx_masks_walker_step(w)) == NGX_OK) {
+        /* void */
     }
 
-    /* Initialize top frame */
-    top->dfd = dirfd(top->dh);
-    top->entry = 0;
-    saved_errno = dir_contents_load(&top->contents, top->dh);
+    ngx_masks_walker_stop(w);
 
-    /* Save root path with trailing slashes stripped. */
-    while (p_start > 0 && dirp[p_start - 1] == '/') {
-        p_start--;
-    }
-
-    memcpy(path_buf, dirp, p_start);
-    path_buf[p_start++] = '/';
-    path_buf[p_start] = 0;
-    top->path_prefix_len = p_start;
-
-    /* Ensure that top frame is a directory */
-    if (fstat(top->dfd, &entry.info) != 0) {
-        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, ngx_errno,
-                "ngx_masks_walk_fs: fstat() failed at %s", 
-                path_buf);
-        goto errno_exit;
-    }
-
-    dinfo[0].dev = entry.info.st_dev;
-    dinfo[0].ino = entry.info.st_ino;
-
-    /* Setup initial entry contents */
-    entry.full_path = path_buf;
-    entry.h_name = entry.e_name = path_buf + p_start;
-    entry.cfd = top->dfd;
-
-    last_checkpoint = time(NULL);
-
-    for (;;) {
-
-        if (checkpoint && *checkpoint) {
-            checkpoint = skip_to_checkpoint(checkpoint, top);
-        }
-
-        if (top->entry >= top->contents.size) {
-            do  {
-                closedir(top->dh);
-                top->dh = NULL;
-                dir_contents_reset(&top->contents);
-                if (top == stack) {
-                    goto done;
-                }
-
-                depth--;
-                top--;
-            } while (top->entry >= top->contents.size);
-
-            ts = time(NULL);
-
-            if (ts != last_checkpoint) {
-                /* Construct name of the last fully processed dir */
-                path_buf[top[1].path_prefix_len] = 0;
-                on_checkpoint(on_checkpoint_ctx,
-                              path_buf + stack[0].path_prefix_len);
-                last_checkpoint = ts;
-            }
-
-            path_buf[top->path_prefix_len] = 0;
-            entry.cfd = top->dfd;
-            entry.e_name = path_buf + top->path_prefix_len;
-            checkpoint = NULL;
-        }
-
-        e = top->contents.elts[top->entry];
-        top->entry++;
-
-        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                "ngx_masks_walk_fs: fstat at(%s/%s): %s", path_buf, e->name,
-                strerror(errno));
-
-        if (fstatat(top->dfd, e->name, &entry.info, 0) != 0) {
-            continue;
-        }
-
-        if (S_ISDIR(entry.info.st_mode)) {
-
-            if (depth + 1 >= MAX_DEPTH) {
-                continue;
-            }
-
-            top[1].dfd = openat(top->dfd, e->name, O_RDONLY | O_DIRECTORY);
-            if (top[1].dfd == -1) {
-                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                    "ngx_masks_walk_fs: openat(%s/%s) failed: %s",
-                    path_buf, e->name, strerror(errno));
-                continue;
-            }
-
-            /* Protect against recursion */
-            for (i = 0; i <= depth; i++) {
-
-                if (entry.info.st_ino == dinfo[i].ino
-                        && entry.info.st_dev == dinfo[i].dev)
-                {
-                    break;
-                }
-            }
-
-            if (i <= depth) {
-                /* We get here if recursion had been detected */
-                close(top[1].dfd);
-                continue;
-            }
-
-            /* Load new directory contents */
-            top[1].dh = fdopendir(top[1].dfd);
-            if (top[1].dh == NULL) {
-
-                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                    "ngx_masks_walk_fs: fdopendir(%s/%s) failed: %s",
-                    path_buf, e->name, strerror(errno));
-
-                close(top[1].dfd);
-                top[1].dh = NULL;
-                continue;
-            }
-
-            if (dir_contents_load(&top[1].contents, top[1].dh) != 0) {
-                dir_contents_reset(&top[1].contents);
-                closedir(top[1].dh);
-                top[1].dh = NULL;
-                continue;
-            }
-
-            memcpy(path_buf + top->path_prefix_len, e->name, e->namelen);
-            path_buf[top->path_prefix_len + e->namelen] = '/';
-            path_buf[top->path_prefix_len + e->namelen + 1] = 0;
-            top[1].path_prefix_len = top->path_prefix_len + 1 + e->namelen;
-            top[1].entry = 0;
-
-            entry.cfd = top[1].dfd;
-            entry.e_name = path_buf + top[1].path_prefix_len;
-
-            top++;
-            depth++;
-            dinfo[depth].dev = entry.info.st_dev;
-            dinfo[depth].ino = entry.info.st_ino;
-
-        } else if (S_ISREG(entry.info.st_mode)) {
-
-            memcpy(path_buf + top->path_prefix_len, e->name, e->namelen + 1);
-
-            if (on_file(on_file_ctx, &entry) == NGX_ABORT) {
-                goto aborted;
-            }
-
-            ts = time(NULL);
-            if (ts != last_checkpoint) {
-                on_checkpoint(on_checkpoint_ctx,
-                              path_buf + stack[0].path_prefix_len);
-                last_checkpoint = ts;
-            }
-        }
-    }
-
-done:
-    walker_cleanup(stack, MAX_DEPTH, &free_list);
-    return NGX_OK;
-
-aborted:
-    walker_cleanup(stack, MAX_DEPTH, &free_list);
-    return NGX_ABORT;
-
-errno_exit:
-    /* Close all handles and release all memory while preserving errno */
-    saved_errno = errno;
-    walker_cleanup(stack, MAX_DEPTH, &free_list);
-    errno = saved_errno;
-
-    return NGX_ERROR;
+    return rc == NGX_DONE ? NGX_OK : rc;
 }
-

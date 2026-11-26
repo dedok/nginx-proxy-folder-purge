@@ -1,6 +1,6 @@
 
 /**
- * (C)
+ * (C) BSD, Vas Soshnikov
  */
 
 #include <ngx_masks_storage_utils.h>
@@ -8,18 +8,23 @@
 #include <sys/file.h>
 
 
-#define LOCK_RETRY_INTERVAL_MS 500
-
-
 /**
- * Acquire lock file of return an error
+ * Take the lock file of the masks storage without waiting.
+ *
+ * The lock makes it one background purger per masks storage, for example
+ * while a new nginx and the old one are running together.
+ *
+ * @retval NGX_OK the lock is taken, it is held until the process exits
+ * @retval NGX_BUSY another process holds the lock, m->lock_holder is its
+ *         pid, or 0 when it is not known
+ * @retval NGX_ERROR
+ *
+ * There is no lock at all when startup_lock_delay is switched off.
  */
 ngx_int_t
-ngx_masks_storage_acquire_lock_file(ngx_cycle_t *cycle,
-                                    ngx_masks_storage_t *m, ngx_str_t *dirname)
+ngx_masks_storage_try_lock_file(ngx_masks_storage_t *m)
 {
-    ngx_msec_t  start, now, till, elapsed;
-    int         lock_fd;
+    int         lock_fd, err;
     char        lock_path[PATH_MAX + 1];
     char        pid[32];
     ssize_t     len;
@@ -28,78 +33,68 @@ ngx_masks_storage_acquire_lock_file(ngx_cycle_t *cycle,
         return NGX_OK;
     }
 
-    ngx_snprintf((u_char*) lock_path, sizeof(lock_path),
-                 "%V/.lock%Z", dirname);
+    /* the name of the masks storage ends with a slash */
+    ngx_snprintf((u_char *) lock_path, sizeof(lock_path),
+                 "%V.lock%Z", &m->path->name);
 
     lock_fd = open(lock_path, O_RDWR | O_CREAT, 0644);
     if (lock_fd == -1) {
-        ngx_log_error(NGX_LOG_EMERG, m->log, ngx_errno,
-                      "Unable to open/create lock file at %s", lock_path);
+        ngx_log_error(NGX_LOG_ERR, m->log, ngx_errno,
+                      "proxy_folder_purge: can't open or create the lock "
+                      "file %s", lock_path);
         return NGX_ERROR;
     }
 
-    ngx_time_update();
-    now = start = ngx_current_msec;
-    till = ngx_current_msec + m->background_purger_startup_lock_wait * 1000u;
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        err = errno;
 
-    while (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        m->lock_holder = 0;
 
-        now = ngx_current_msec;
+        if (err == EWOULDBLOCK) {
 
-        if (now >= till) {
-            /*
-             * Try to read pid of owning process from lock file
-             */
+            /* Try to read the pid of the process that holds the lock */
             len = pread(lock_fd, pid, sizeof(pid) - 1, 0);
+
             if (len > 0) {
                 pid[len] = 0;
-            } else {
-                strcpy(pid, "<unknown>");
+
+                m->lock_holder = ngx_atoi((u_char *) pid, len);
+
+                if (m->lock_holder == NGX_ERROR) {
+                    m->lock_holder = 0;
+                }
             }
 
-            close(lock_fd);
-
-            ngx_log_error(NGX_LOG_EMERG, m->log, 0,
-                          "Unable to acquire lock on file %s held by pid %s",
-                          lock_path, pid);
-
-            return NGX_ERROR;
+        } else {
+            ngx_log_error(NGX_LOG_ERR, m->log, err,
+                          "proxy_folder_purge: flock() on %s failed",
+                          lock_path);
         }
 
-        elapsed = now + LOCK_RETRY_INTERVAL_MS < till ?
-                        LOCK_RETRY_INTERVAL_MS :
-                        till - now;
-        usleep(elapsed * 1000u);
+        close(lock_fd);
 
-        ngx_process_events_and_timers(cycle);
-
-        if (ngx_quit || ngx_terminate) {
-            close(lock_fd);
-            return NGX_ABORT;
-        }
-
-        now = ngx_current_msec;
+        return err == EWOULDBLOCK ? NGX_BUSY : NGX_ERROR;
     }
 
     /*
-     * Store our pid into lock file
+     * Store our pid into the lock file
      */
-    len = snprintf(pid, sizeof(pid), "%d", (int) getpid());
+    len = snprintf(pid, sizeof(pid), "%d", (int) ngx_getpid());
     if (write(lock_fd, pid, len) != len || ftruncate(lock_fd, len) != 0) {
         ngx_log_error(NGX_LOG_NOTICE, m->log, ngx_errno,
-                      "Unable to store pid to %s (ignored)", lock_path);
+                      "proxy_folder_purge: can't store the pid in %s "
+                      "(ignored)", lock_path);
     }
 
-    /* NOTE: we don't close lock descriptor and rely on it being closed when
-     *       process exits */
-    elapsed = start - now;
-
+    /* NOTE: the descriptor is not closed on purpose: the lock is held
+     *       until the process exits */
     ngx_log_error(NGX_LOG_NOTICE, m->log, 0,
-                  "Acquired lock on file %s in %u.%03us", lock_path,
-                  elapsed / 1000u, elapsed % 1000u);
+                  "proxy_folder_purge: the lock %s is taken by pid %P",
+                  lock_path, ngx_pid);
 
     return NGX_OK;
 }
+
 
 
 char*

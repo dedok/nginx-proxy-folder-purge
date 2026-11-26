@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 #
-# (C) BSD v2
+# (C) BSD, Vas Soshnikov
 #
 
 #
@@ -30,6 +30,12 @@ class OriginHandler(BaseHTTPRequestHandler):
 
     protocol_version = 'HTTP/1.1'
     server_version = 'purge-test-origin/1.0'
+
+    # The headers and the body of a response are two writes. With the Nagle
+    # algorithm on, the second one waits up to 40 ms for the acknowledgement
+    # of the first one on a connection that is kept, and nginx keeps its
+    # connections to the origin since 1.29.7.
+    disable_nagle_algorithm = True
 
     def do_GET(self):
         self.serve()
