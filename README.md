@@ -205,7 +205,7 @@ Enable or disable `foreground purge`. If it sets to `on`, then cache would be up
 				proxy_folder_purge_on_request on;
             }
 			location /off {
-                proxy_folder_purge_on_request off;
+				proxy_folder_purge_on_request off;
                 ...
             }
         }
