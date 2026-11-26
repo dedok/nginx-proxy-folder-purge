@@ -120,6 +120,9 @@ static ngx_int_t ngx_masks_is_fresh(u_char *key,
         ngx_http_file_cache_t *cache, time_t purge_time);
 static void ngx_masks_mark_fresh(u_char *key, ngx_http_file_cache_t *cache,
         time_t date);
+static ngx_int_t ngx_masks_key_split(ngx_str_t *key, ngx_str_t *hostname,
+        ngx_str_t *url);
+static ngx_int_t ngx_masks_request_key(ngx_http_request_t *r, ngx_str_t *key);
 
 static ngx_int_t ngx_masks_storage_init_module(ngx_cycle_t *cycle);
 static ngx_int_t ngx_masks_storage_init_process(ngx_cycle_t *cycle);
@@ -2352,8 +2355,68 @@ ngx_masks_storage_bypass_var(ngx_http_request_t *r,
 
 
 /**
- * The time of the latest active purge that covers the URL of the request,
+ * The key of the cache entry of the request, the way nginx writes it into
+ * the cache file: the keys of the location one after the other.
+ *
+ * @param r    the request, it has to have a cache entry
+ * @param key  the key
+ * @retval NGX_OK      the key is in "key"
+ * @retval NGX_DECLINED there is no key
+ * @retval NGX_ERROR    not enough memory
+ */
+static ngx_int_t
+ngx_masks_request_key(ngx_http_request_t *r, ngx_str_t *key)
+{
+    size_t       len;
+    ngx_uint_t   i;
+    u_char      *p;
+    ngx_str_t   *keys;
+    ngx_array_t *all;
+
+    all = &r->cache->keys;
+
+    if (all->nelts == 0) {
+        return NGX_DECLINED;
+    }
+
+    keys = all->elts;
+
+    if (all->nelts == 1) {
+        *key = keys[0];
+        return NGX_OK;
+    }
+
+    len = 0;
+
+    for (i = 0; i < all->nelts; i++) {
+        len += keys[i].len;
+    }
+
+    p = ngx_pnalloc(r->pool, len);
+
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    key->data = p;
+
+    for (i = 0; i < all->nelts; i++) {
+        p = ngx_cpymem(p, keys[i].data, keys[i].len);
+    }
+
+    key->len = len;
+
+    return NGX_OK;
+}
+
+
+/**
+ * The time of the latest active purge that covers the object of the request,
  * NGX_MASKS_NO_PURGE when there is no such purge.
+ *
+ * The object is looked up by the url and the hostname of the key of its
+ * cache entry, read the way the background purge reads them out of the keys
+ * of the cache files: the two purges decide the same about an object.
  */
 static time_t
 ngx_masks_storage_purge_time(ngx_http_request_t *r,
@@ -2362,7 +2425,8 @@ ngx_masks_storage_purge_time(ngx_http_request_t *r,
     ngx_masks_storage_shctx_t        *sh;
     ngx_slab_pool_t                  *shpool;
     ngx_domain_rbtree_node_t         *node;
-    ngx_str_t                        *mask, domain, *url, temp_url;
+    ngx_str_t                        *mask, key, hostname, domain;
+    ngx_str_t                        url, temp_url;
     ngx_mask_t                       *v;
     ngx_masks_storage_t              *masks_storage;
     time_t                            purge_time;
@@ -2375,9 +2439,27 @@ ngx_masks_storage_purge_time(ngx_http_request_t *r,
     purge_time = NGX_MASKS_NO_PURGE;
     sh = masks_storage->sh;
     shpool = masks_storage->shpool;
-    url = &r->uri;
+
+    if (ngx_masks_request_key(r, &key) != NGX_OK
+            || ngx_masks_key_split(&key, &hostname, &url) != NGX_OK)
+    {
+        /** The cache entry has no key, or its key does not say which url the
+         * object is for. The background purge leaves such files alone too */
+        return purge_time;
+    }
+
     domain = make_domain_key(r->pool, &conf->cache_path,
                 &r->headers_in.server);
+
+    /* A mask belongs to one hostname. A key that names a hostname has to
+     * name that one, the background purge makes the same check */
+    if (hostname.len != 0
+            && !(hostname.len == r->headers_in.server.len
+                 && ngx_strncmp(hostname.data, r->headers_in.server.data,
+                                hostname.len) == 0))
+    {
+        return purge_time;
+    }
 
     ngx_shmtx_lock(&shpool->mutex);
 
@@ -2397,8 +2479,8 @@ ngx_masks_storage_purge_time(ngx_http_request_t *r,
         goto out;
     }
 
-    temp_url.len = url->len;
-    temp_url.data = url->data;
+    temp_url.len = url.len;
+    temp_url.data = url.data;
     cnt = 0;
 
     while (temp_url.len > 0) {
@@ -2426,7 +2508,7 @@ ngx_masks_storage_purge_time(ngx_http_request_t *r,
                     "proxy_folder_purge: compare "
                     "mask = \"%V\" ~ temp_url = \"%V\" ~ url = \"%V\", "
                     "purge_start_time = %T",
-                    mask, &temp_url, url, v->purge_start_time);
+                    mask, &temp_url, &url, v->purge_start_time);
 
             if (fnmatch_adapter(r->pool, r->connection->log,
                     mask, &temp_url) == 0
@@ -3004,6 +3086,64 @@ exit:
 }
 
 
+/**
+ * The hostname and the url of a cache key.
+ *
+ * A cache file says about its object only what is in its key, so the
+ * background purge reads the hostname and the url out of the keys of the
+ * files it looks at. The foreground purge reads the key of a request the
+ * same way, so the two decide the same about an object.
+ *
+ * The hostname is the text before the last ":" before the first "/", there
+ * is none when the key has no ":" there. The url starts at the first "/"
+ * and ends at "|", at a new line or at "[".
+ *
+ * @param key      the key of a cache entry
+ * @param hostname the hostname of the key, its length is 0 when there is none
+ * @param url      the url of the key
+ * @retval NGX_OK      the key has a url
+ * @retval NGX_DECLINED the key has no "/"
+ */
+static ngx_int_t
+ngx_masks_key_split(ngx_str_t *key, ngx_str_t *hostname, ngx_str_t *url)
+{
+    u_char  *p, *colon, *last, *end;
+
+    last = key->data + key->len;
+    colon = NULL;
+
+    for (p = key->data; p < last; p++) {
+
+        if (*p == '/') {
+            break;
+        }
+
+        if (*p == ':') {
+            colon = p;
+        }
+    }
+
+    if (p == last) {
+        return NGX_DECLINED;
+    }
+
+    hostname->data = key->data;
+    hostname->len = colon != NULL ? (size_t) (colon - key->data) : 0;
+
+    for (end = p; end < last; end++) {
+
+        if (*end == '|' || *end == LF || *end == '[') {
+            break;
+        }
+    }
+
+    url->data = p;
+    url->len = (size_t) (end - p);
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_masks_storage_purge_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
 {
@@ -3013,16 +3153,12 @@ ngx_masks_storage_purge_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
 
     ngx_remove_file_ctx_t            *ctx = ctx_;
 
-    ngx_str_t                         url, domain;
+    ngx_str_t                         url, domain, key;
     ngx_masks_storage_t              *m;
     ngx_int_t                         fd, rc;
     u_char                            buf[sizeof(ngx_http_file_cache_header_t)
                                          + sizeof(cache_key) + 2 * 4096]
                                          __attribute__((aligned(sizeof(ngx_uint_t))));
-    u_char                           *buf_start,
-                                     *buf_end,
-                                     *url_start,
-                                     *url_end;
     ngx_http_file_cache_header_t     *h;
     ngx_mask_row_t                   *row,
                                      *fm;
@@ -3072,8 +3208,8 @@ ngx_masks_storage_purge_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
 
     h = (ngx_http_file_cache_header_t *) &buf[0];
 
-    buf_start = &buf[0] + header_size;
-    buf_end = &buf[0] + rc;
+    key.data = &buf[0] + header_size;
+    key.len = (size_t) rc - header_size;
 
     rc = NGX_OK;
 
@@ -3083,56 +3219,14 @@ ngx_masks_storage_purge_file(void *ctx_, ngx_masks_fs_walker_ctx *entry)
         goto exit;
     }
 
-    domain.data = buf_start;
-    domain.len = 0;
-
-    /** TODO:
-     *  this should be removed in the future, since it
-     *  can make module less predictable for users.
-     *  Also check matching logic
-     *  Skip schema if exists {{{ */
-    while (buf_start < buf_end && *buf_start != '/') {
-
-        /** Read a domain, if exist: */
-        if (*buf_start == ':') {
-            domain.len = (size_t) (buf_start - domain.data);
-        }
-
-        buf_start++;
-    }
-
-    if (domain.len == 0) {
-        domain.data = NULL;
-    }
-    /** }}} */
-
-    if (buf_start == buf_end) {
-        /** The key does not say which url it is for */
+    if (ngx_masks_key_split(&key, &domain, &url) != NGX_OK) {
+        /** The key does not say which url its object is for */
         ngx_log_error(NGX_LOG_INFO, m->log, 0,
                 "proxy_folder_purge: ngx_masks_storage_purge_file: "
-                "can't find an url in the key at \"%s\", skiping",
+                "can't find an url in the key at \"%s\", skipping",
                 entry->full_path);
         goto exit;
     }
-
-    url_start = buf_start;
-    url_end = buf_end;
-
-    /** Exclude extra cache args: */
-    for ( ;buf_start != buf_end; ++buf_start) {
-
-        if (*buf_start == '|'
-            || *buf_start == '\n'
-            || *buf_start == '[')
-        {
-            url_end = buf_start;
-            break;
-        }
-    }
-
-    url.data = url_start;
-    url.len = (size_t) (url_end - url_start);
-    /** }}} */
 
     /** Compare urls & dates */
     part = &ctx->purge_urls->part;

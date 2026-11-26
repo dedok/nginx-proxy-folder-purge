@@ -151,6 +151,36 @@ switch `open_file_cache` on for the locations that serve from the cache. The
 module logs a warning when it sees a location with `open_file_cache` where
 the deleted file would go on being served.
 
+### How a mask is matched
+A mask is a pattern for urls, `*` and `?` have their `fnmatch` meaning, and
+it covers the urls of its folder at any depth: `/img/*` covers `/img/a.png`
+and `/img/2026/b.png`.
+
+Both purges read the url of an object out of its cache key: the foreground
+purge out of the key of the request, the background purge out of the key a
+cache file begins with. So the two decide the same about an object.
+
+The hostname of a key is the text before the last `:` before its first `/`,
+there is none when the key has no `:` there. The url starts at that `/` and
+ends at `|`, at a new line or at `[`. A mask belongs to the hostname of its
+PURGE request: the foreground purge applies it to the reads that come with
+that hostname, the background purge removes the files whose key names that
+hostname, and every file with the url when the key names none.
+
+`$host:$uri` is the layout the module is tested with.
+
+```bash
+proxy_cache_key $host:$uri;              # hostname $host, url $uri
+proxy_cache_key $uri;                    # no hostname in the key
+proxy_cache_key $host:$uri$is_args$args; # the url has the arguments in it
+```
+
+Whatever the key carries after the uri is a part of the url for both purges:
+a mask with a fixed tail, `*.jpg`, does not cover `/a.jpg?v=2`, and a mask
+can be made for the arguments. A key that starts with a scheme,
+`$scheme://$host$uri`, has the scheme read as its hostname, so no mask is
+applied to the objects of such a cache.
+
 Configuration directives
 ========================
 proxy_folder_purge_on_request [on|off]
@@ -193,6 +223,7 @@ mask and is not newer than that purge: the copy is not taken from the cache,
 the one fetched from the origin is cached as usual. For any other request the
 variable is empty. Without the directive a purged object is served from the
 cache, i.e. `proxy_folder_purge_on_request` has nothing to switch on there.
+What a mask covers is described in [How a mask is matched](#how-a-mask-is-matched).
 
 HTTP API
 ========

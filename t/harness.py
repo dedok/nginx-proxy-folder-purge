@@ -167,6 +167,7 @@ class Nginx(object):
                   '@MASKS_DIR@': sandbox,
                   '@LOG_LEVEL@': LOG_LEVEL,
                   '@MAX_MASKS@': 1000,
+                  '@CACHE_KEY@': '$host:$uri',
                   '@CACHE_INACTIVE@': '60m',
                   '@OFC_VALID@': '300s',
                   '@PURGER_FILES@': 100,

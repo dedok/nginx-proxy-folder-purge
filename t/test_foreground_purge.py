@@ -244,18 +244,43 @@ def test_purge_needs_proxy_cache_bypass(ctx):
              'got %r' % r.headers.get('x-folder-purge-bypass'))
 
 
-def test_purge_does_not_depend_on_the_cache_key_format(ctx):
-    """The purge matches the URL of the request, whatever the cache key is."""
+def test_purge_reads_the_object_out_of_the_cache_key(ctx):
+    """The foreground purge reads the url and the hostname out of the cache key.
+
+    It reads them the way the background purge reads them out of the keys of
+    the cache files, so the two decide the same about an object. The
+    hostname of a key is the text before the last ":" before its first "/",
+    and a mask belongs to one hostname. The key of the /keyed/ location
+    starts with a scheme, so its hostname is read as "http": the mask made
+    for purge_folder is not applied to the object, and the background purge
+    would not remove the file of the object either.
+    """
     cached = ctx.expect('/keyed/a.txt', 'MISS').body
     ctx.purge_across_second('/keyed/*')
 
-    fresh = ctx.expect('/keyed/a.txt', 'BYPASS')
+    ctx.expect('/keyed/a.txt', 'HIT', cached)
+
+
+def test_mask_is_compared_with_the_url_of_the_cache_key(ctx):
+    """The mask has to cover the url of the cache key, arguments included.
+
+    The key of the /args/ location has the arguments of the request after
+    the uri. The background purge compares the mask with the same text.
+    """
+    bodies = ctx.prime('/args/a.jpg?v=2', '/args/b.txt?n=1')
+    ctx.purge_across_second('/args/*.jpg')
+    ctx.purge_across_second('/args/b*1')
+
+    # The mask ends with ".jpg", the url of the key goes on after it
+    ctx.expect('/args/a.jpg?v=2', 'HIT', bodies['/args/a.jpg?v=2'])
+
+    # The mask covers the arguments, the uri of the request has none
+    cached = bodies['/args/b.txt?n=1']
+    fresh = ctx.expect('/args/b.txt?n=1', 'BYPASS')
 
     if fresh.body == cached:
-        fail('GET /keyed/a.txt after the purge: expected a fresh body, got '
-             'the cached one %r' % cached)
-
-    ctx.expect('/keyed/a.txt', 'HIT', fresh.body)
+        fail('GET /args/b.txt?n=1 after the purge: expected a fresh body, '
+             'got the cached one %r' % cached)
 
 
 def test_expired_object_is_left_to_nginx(ctx):

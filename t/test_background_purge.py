@@ -84,9 +84,16 @@ def attempts(ctx):
 
 
 def masks_state(ctx):
-    """Everything there is in the masks storage, the lock included."""
+    """Everything there is in the masks storage, the lock included.
+
+    The saved position of the purge is in it by its name only: the running
+    purge rewrites the position once in a second.
+    """
     state = {}
     for name in sorted(os.listdir(ctx.masks_dir)):
+        if name.startswith(CHECKPOINT):
+            state[name] = None
+            continue
         with open(os.path.join(ctx.masks_dir, name), 'rb') as f:
             state[name] = f.read()
     return state
@@ -346,15 +353,54 @@ def test_masks_survive_a_crash(ctx):
 test_masks_survive_a_crash.vars = QUIET
 
 
-# 100 cache files per slice, 50 ms between the slices
+def test_both_purges_read_the_cache_key_the_same_way(ctx):
+    """The foreground and the background purge decide the same about an object.
+
+    Both read the url out of the cache key. With the arguments of the request
+    in the key, a mask with a fixed tail does not cover an object that has
+    arguments, and a mask can match the arguments. The objects under
+    /fg/same/read/ are asked for while the masks live: the foreground purge
+    answers. The objects under /fg/same/files/ are asked for once the
+    background purge is over: the ones it removed are fetched again.
+    """
+    read = ['/fg/same/read/a.jpg', '/fg/same/read/a.jpg?v=2',
+            '/fg/same/read/b.txt?n=1']
+    files = ['/fg/same/files/a.jpg', '/fg/same/files/a.jpg?v=2',
+             '/fg/same/files/b.txt?n=1']
+    bodies = ctx.prime(*(read + files))
+
+    for prefix in ('/fg/same/read/', '/fg/same/files/'):
+        ctx.purge_ok(prefix + '*.jpg')
+        ctx.purge_ok(prefix + 'b*1')
+
+    ctx.expect('/fg/same/read/a.jpg', 'BYPASS')
+    ctx.expect('/fg/same/read/b.txt?n=1', 'BYPASS')
+    ctx.expect('/fg/same/read/a.jpg?v=2', 'HIT',
+               bodies['/fg/same/read/a.jpg?v=2'])
+
+    wait_consumed(ctx)
+
+    ctx.expect('/fg/same/files/a.jpg', 'MISS')
+    ctx.expect('/fg/same/files/b.txt?n=1', 'MISS')
+    ctx.expect('/fg/same/files/a.jpg?v=2', 'HIT',
+               bodies['/fg/same/files/a.jpg?v=2'])
+
+
+test_both_purges_read_the_cache_key_the_same_way.vars = dict(
+    QUIET, CACHE_KEY='$host:$uri$is_args$args')
+
+
+# 50 cache files per slice, 60 ms between the slices
 
 def test_crash_during_purge_is_resumed(ctx):
     """A purge that a crash interrupted is finished after the start.
 
-    The purger looks at 100 files per slice and is called again 50 ms later,
-    so the walk of the 3000 files takes about two seconds, long enough to
-    kill nginx in the middle of it. The purger saves its position once in a
-    second.
+    The purger looks at 50 files per slice and is called again 60 ms later,
+    so the walk of the 3000 files takes at least 3.6 seconds, whatever the
+    disk is: long enough to kill nginx in the middle of it. The purger
+    saves its position once in a second, and the first one comes up to a
+    second after the walk begins, so the position is on the disk long
+    before 900 files are gone.
     """
     gone = ['/walk/gone/%04d.txt' % i for i in range(1500)]
     kept = ['/walk/kept/%04d.txt' % i for i in range(1500)]
@@ -366,16 +412,18 @@ def test_crash_during_purge_is_resumed(ctx):
     def removed():
         return total - ctx.cache_count()
 
-    # 900 deleted files are about 1800 walked ones, i.e. 9 slices
-    ctx.wait_until(lambda: 900 <= removed() < 1400, harness.BG_PURGE_TIMEOUT,
-                   'the start of the purge (the purger looks for masks once '
-                   'in a second when it is idle)')
+    def in_the_middle():
+        """From 900 to 1400 files are gone, and the position is saved."""
+        return (900 <= removed() < 1400
+                and os.path.exists(ctx.checkpoint))
+
+    # 900 deleted files are about 1800 walked ones, i.e. 36 slices
+    ctx.wait_until(in_the_middle, harness.BG_PURGE_TIMEOUT,
+                   'the purge in the middle of the walk, with its position '
+                   'saved (the purger looks for masks once in a second when '
+                   'it is idle)')
 
     ctx.crash()
-
-    if not os.path.exists(ctx.checkpoint):
-        fail('expected the saved position %s in %s after the crash, got %r' % (
-            CHECKPOINT, ctx.masks_dir, ctx.masks_files()))
 
     ctx.start()
 
@@ -387,7 +435,10 @@ def test_crash_during_purge_is_resumed(ctx):
         ctx.expect(kept[i], 'HIT', bodies[kept[i]])
 
     wait_consumed(ctx)
-test_crash_during_purge_is_resumed.vars = {'PURGER_SLEEP': '50ms'}
+
+
+test_crash_during_purge_is_resumed.vars = {'PURGER_FILES': 50,
+                                           'PURGER_SLEEP': '60ms'}
 
 
 def test_purge_is_done_in_slices(ctx):
