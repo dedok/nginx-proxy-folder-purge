@@ -392,6 +392,22 @@ test_both_purges_read_the_cache_key_the_same_way.vars = dict(
 
 # 50 cache files per slice, 60 ms between the slices
 
+def test_masks_without_a_cache_path_do_not_pile_up(ctx):
+    """A purge without a cache path does not keep its mask.
+
+    The background purge has nothing to remove for such a mask, and it
+    drops the mask all the same. Otherwise the masks would fill the quota
+    of the hostname, and its next purges would get 429.
+    """
+    for i in range(12):
+        ctx.purge_ok('/nocachepath/%02d/*' % i)
+        wait_consumed(ctx)
+
+
+test_masks_without_a_cache_path_do_not_pile_up.vars = {
+    'MAX_MASKS': 10, 'PURGER_POLL': '100ms'}
+
+
 def test_crash_during_purge_is_resumed(ctx):
     """A purge that a crash interrupted is finished after the start.
 
@@ -873,6 +889,36 @@ def test_unreadable_cache_file_does_not_stop_the_purge(ctx):
     if ctx.cache_managers() != managers:
         fail('the cache manager process has been respawned: %r -> %r'
              % (managers, ctx.cache_managers()))
+
+
+def test_purge_without_a_cache_path_is_warned_about(ctx):
+    """A purge accepted where no cache path is named is warned about.
+
+    The background purge removes the files of the cache directory named by
+    proxy_folder_purge_cache_path. Where the directive is empty it has no
+    directory to remove the files from: the log says so, and the files of
+    the purge stay.
+    """
+    cached = ctx.expect('/nocachepath/a.txt', 'MISS').body
+    ctx.expect('/withcachepath/a.txt', 'MISS')
+
+    ctx.purge_ok('/nocachepath/*')
+    ctx.purge_ok('/withcachepath/*')
+
+    warned = ctx.log_lines('proxy_folder_purge_cache_path is not set')
+    if len(warned) != 1:
+        fail('expected one warning, for the purge of /nocachepath/*, got '
+             '%d:\n%s' % (len(warned), '\n'.join(w.strip() for w in warned)))
+
+    if '/nocachepath/*' not in warned[0]:
+        fail('the warning is not about the purge of /nocachepath/*:\n%s'
+             % warned[0].strip())
+
+    wait_consumed(ctx)
+
+    ctx.expect('/nocachepath/a.txt', 'HIT', cached)
+    ctx.expect('/withcachepath/a.txt', 'MISS')
+
 
 
 if __name__ == '__main__':

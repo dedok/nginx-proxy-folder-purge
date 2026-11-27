@@ -919,6 +919,7 @@ static ngx_int_t
 ngx_masks_write_to_masks_in(ngx_masks_storage_t *ms,
         ngx_str_t *domain, ngx_mask_t *mask)
 {
+    u_char      *p;
     ngx_str_t    b;
     ngx_str_t    masks_in;
 
@@ -939,8 +940,11 @@ ngx_masks_write_to_masks_in(ngx_masks_storage_t *ms,
         return NGX_ERROR;
     }
 
-    ngx_snprintf(masks_in.data, masks_in.len, "%V%s%d%Z",
+    p = ngx_snprintf(masks_in.data, masks_in.len, "%V%s%d%Z",
             &ms->path->name, MASKS_IN, (ngx_int_t) ngx_getpid());
+
+    /* the zero that ends the name for open() is not a part of the length */
+    masks_in.len = (size_t) (p - masks_in.data - 1);
 
     if (ngx_serialize_mask(ms, &b, domain, mask) != NGX_OK) {
         /** Well we don't need close FD here. This isn't a system bug
@@ -978,8 +982,8 @@ ngx_masks_write_to_masks_in(ngx_masks_storage_t *ms,
         return NGX_ERROR;
     }
 
-    ngx_log_error(NGX_LOG_INFO, ms->log, errno,
-            "proxy_folder_purge: write to \"%V\", fd = %d, bytes = %d",
+    ngx_log_error(NGX_LOG_INFO, ms->log, 0,
+            "proxy_folder_purge: write to \"%V\", fd = %d, bytes = %uz",
             &masks_in, ms->masks_in_fd, b.len);
 
     /** Make sure, that the data flushed */
@@ -2646,6 +2650,17 @@ ngx_http_folder_cache_purge(ngx_http_request_t *r)
                 MASKS_STORAGE_PURGE_REF_COUNT_MAX_STR);
     }
 
+    if (rc == NGX_MASKS_STORAGE_OK && conf->cache_path.len == 0
+            && !conf->masks_storage->background_purger_off)
+    {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                "proxy_folder_purge: the purge of \"%V\" is accepted, but "
+                "proxy_folder_purge_cache_path is not set in this location: "
+                "the background purge has no cache directory to remove the "
+                "files of the purge from, only the foreground purge applies "
+                "the mask", &mask);
+    }
+
     return rc;
 }
 
@@ -4111,8 +4126,10 @@ parse_domain_key(ngx_str_t *b, ngx_str_t *cache_path, ngx_str_t *domain)
 {
     u_char *p, *e;
 
-    domain->data = (cache_path->data = b->data);
-    domain->len = (cache_path->len = b->len);
+    /* The key of a mask made without a cache path is the hostname alone */
+    ngx_str_set(cache_path, "");
+    domain->data = b->data;
+    domain->len = b->len;
 
     p = b->data;
     e = b->data + b->len;
@@ -4123,7 +4140,8 @@ parse_domain_key(ngx_str_t *b, ngx_str_t *cache_path, ngx_str_t *domain)
             ++p;
             domain->data = p;
             domain->len = (size_t) (e - p);
-            cache_path->len = cache_path->len - domain->len - 1;
+            cache_path->data = b->data;
+            cache_path->len = domain->data - b->data - 1;
             return;
         }
     }

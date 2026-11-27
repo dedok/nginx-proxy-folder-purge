@@ -25,6 +25,7 @@
 #
 
 import os
+import re
 import time
 
 import harness
@@ -409,6 +410,58 @@ def test_masks_per_domain_limit(ctx):
 
 # The minimum that folder_purge accepts is 10 masks per domain
 test_masks_per_domain_limit.vars = {'MAX_MASKS': 10}
+
+
+def test_log_names_the_file_of_the_mask(ctx):
+    """The log names the file the mask is written to as it is on the disk.
+
+    The name ends with the number of the worker process, and the line has
+    no zero bytes in it.
+    """
+    ctx.purge_across_second('/logfile/*')
+
+    with open(os.path.join(ctx.sandbox, 'logs', 'error.log'), 'rb') as f:
+        log = f.read()
+
+    zeros = log.count(b'\x00')
+    if zeros:
+        fail('the log of nginx has %d zero bytes in it' % zeros)
+
+    written = re.search(rb'write to "([^"]*)", fd = \d+, bytes = \d+', log)
+
+    if written is None:
+        fail('the log has no line about the file the mask was written to')
+
+    workers = ctx.workers()
+    if len(workers) != 1:
+        fail('expected one worker process, found %r' % workers)
+
+    name = os.path.join(ctx.masks_dir, 'masks.in.%d' % workers[0])
+    logged = written.group(1).decode()
+
+    if logged != name:
+        fail('expected the name %s in the log, got %r' % (name, logged))
+
+    if not os.path.exists(name):
+        fail('there is no file %s: the name in the log is not the one on '
+             'the disk' % name)
+
+
+def test_no_warning_about_the_cache_path_with_purger_off(ctx):
+    """The warning about the cache path is for the background purge only.
+
+    This configuration has the background purge switched off: nothing is
+    warned about where no cache path is named.
+    """
+    ctx.expect('/nocachepath/a.txt', 'MISS')
+    ctx.purge_across_second('/nocachepath/*')
+    ctx.expect('/nocachepath/a.txt', 'BYPASS')
+
+    warned = ctx.log_lines('proxy_folder_purge_cache_path is not set')
+    if warned:
+        fail('the background purge is off, the log warns about the cache '
+             'path anyway:\n%s' % warned[0].strip())
+
 
 
 if __name__ == '__main__':
